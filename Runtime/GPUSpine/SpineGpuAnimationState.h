@@ -167,7 +167,9 @@ public:
     size_t TrackCount() const { return m_Tracks.size(); }
 
     void Update(float delta);
-    // 返回 !ok 只可能是"容器不自洽 / 遇到本阶段不做的时间轴"——此时骨架状态已被部分改写。
+    // 返回 !ok 只可能是"容器不自洽 / 时间轴下标越界"（2026-10-30 起已没有"本阶段不做"的
+    // 时间轴类型了：IK / transform / pathSpacing 三类约束参数时间轴已实现）——此时骨架状态
+    // 已被部分改写。
     // `applied` 非空时写入参考实现 `apply()` 的返回值（是否有任何轨道被应用）。
     SpineImportResult Apply(SpineGpuSkeletonState& skeleton, bool* applied = nullptr);
 
