@@ -25,6 +25,7 @@
 | A | **第一批 `__restrict`**：`ExpandDeformFrame` 的 setup 累加 + `ApplyDeform` 主插值循环 | **快 3.0~4.7%** | anim 比值 0.70x → 0.82/0.82/0.83x；total 1.35x → 1.45~1.46x | ✅ 已合入 |
 | B | **第二批 `__restrict`**：全模块扫描（末帧分支 / `alpha != 1` 分支 / `time < FirstTime()` / `ClipTriangles`） | **快 ~0.3%**（噪声边缘） | 我们侧 anim 合计 −0.18% / −0.34%（两轮） | ✅ 已合入，但**别再指望这条线出量** |
 | C | **P1 融合快路径**：`alpha == 1` 时不物化 prev/next，一趟从"稀疏帧 + setup"直写 | **慢 1.7~3.5%** | 访存 8.01 → 3.18 次/float（**降了 60%**）却更慢 | ❌ **已做并否决**，代码已删 |
+| D | **载入期预解析** `GetFrames()` + 曲线查表（§1.6） | **anim 快 16%** | anim 我们/参考 1.293x → 1.088x 慢；total 1.383x → 1.532x 快；代价 +9.75 MB CPU 共享 | ✅ 已合入 |
 
 **C 的教训（最值钱的一条）**：这段不是带宽受限，是 **SIMD 受限**。展开那三趟
 （`assign` 补 0 / `memcpy` 稀疏段 / 逐点加 setup）都是连续直线循环、能向量化；融合之后
@@ -159,8 +160,60 @@ deform 那块慢 24%（1284 vs 1036.6）、非 deform 那块慢 20%（2211.6 vs 
 **下一个可做的**（也是最像能出量的）：把 `GetFrames()` 的偏移计算与曲线查表从"每帧每条重算"
 改成**载入期预解析进 `SpineGpuRuntimeData`**（每条时间轴直接拿到 `const float* frames` +
 帧数 + 步长），让 apply 的第一件事是"读一个指针"而不是"算三个偏移"。
-代价是运行时数据大一点（每条约 16 B），收益面覆盖**所有类型**。
+代价是运行时数据大一点，收益面覆盖**所有类型**。
 ⚠️ 动之前先按 §1.4/§1.5 的方法重测一遍拿准数（绝对值随机器负载漂，只能看比值与中位数）。
+
+**⇒ 已做，见 §1.6。**
+
+---
+
+### 1.6 载入期预解析 `GetFrames()` + 曲线查表（2026-10-29，已合入）
+
+**做了什么**：新增 `SpineGpuTimelineRt`（`SpineGpuAnimSolver.h`），`SpineGpuRuntimeData::timelines`
+与 `asset.timelines` **一一对应**，载入期（`SpineGpuBuildRuntimeData`）一次算好并**校验**：
+
+| 字段 | 以前在热路上每次算 | 现在 |
+|---|---|---|
+| `frames` | `asset.frames.data() + tl.frame_first` | 直接读指针 |
+| `entries` | `SpineTimelineEntries(type)`（switch） | 直接读 |
+| `target` / `type` | `asset.timelines[tl_index]` 再取一次 | 直接读 |
+| 帧区间越界 | `frame_first + frame_count × entries > frames.size()`（64 位乘加 + 两次 `size()`） | 载入期挡住 |
+| `curve` / `bezier` | `curve_first + 段号`、`curve_bezier_index` 的 `size()` 相等性、bezier 表区间 | 载入期挡住，热路直接下标 |
+
+`GetFrames()` 与 `FrameView` **已删除**（后者的方法搬进了 `SpineGpuTimelineRt`）。
+⚠️ 求值侧**只留**一条检查：`kSpineNoBezierIndex`（这段标了 bezier 但缓存里没表）—— 它是语义，
+读下去就是越界；"曲线缓存没建"那条**前移到载入期**，现在表现为 `SpineGpuBuildRuntimeData` 失败
+（`SpineGpuImportTest` / `SpineGpuHotLoopTest` 里那两条 `Check(!r.ok)` 已改成建表报错）。
+
+**A/B 方法**：同一台机器、同一目录，**两个 exe 交替跑**（`SpineGpuBenchmark_old.exe` /
+`_new.exe`，只差这一笔改动），各跑 4 次（含一次**反序**：new→old，确认不是"跑在后面就更慢"的漂移）。
+⚠️ 绝对比值会漂，所以**两侧都在同一个 exe 里** ⇒ 用 **我们/参考 的倍率**（参考侧就是这次运行的漂移标尺）。
+
+| 口径 | 旧（我们/参考） | 新（我们/参考） | 变化 |
+|---|---|---|---|
+| anim 合计（µs） | 1.285 / 1.301 / 1.291 / 1.285 → 中位 **1.293** | 1.109 / 1.087 / 1.079 / 1.090 → 中位 **1.088** | **−15.9%** |
+| anim 逐资产中位 | 1.502 / 1.476 / 1.471 / 1.530 → **1.489** | 1.292 / 1.221 / 1.244 / 1.328 → **1.268** | **−14.8%** |
+| pose 合计 | 1.180 | 1.193 | 噪声（代码没动） |
+| geo 合计 | 0.446（我们 2.24x 快） | 0.431（我们 2.32x 快） | 噪声（代码没动） |
+| **total** | 0.723 ⇒ 我们 **1.383x 快** | 0.653 ⇒ 我们 **1.532x 快** | |
+
+⇒ **anim 从"比参考慢 29%"降到"比参考慢 9%"**（我们这侧 anim 合计 ≈ 4000 → ≈ 3400 µs）。
+两个口径（合计 / 逐资产中位）差 1 个点，同向 ⇒ 按 §1.5 的判据可信。
+
+**代价**：`SpineGpuTimelineRt` 是 **40 B/条**（估的是 16 B，实测每条多了 `curve` / `bezier`
+两个指针）。781 个资产 CPU 共享内存 **343792.6 → 353776.8 KB = +9.75 MB**（+2.9%，
+逐资产中位 229.22 → 238.82 KB，≈ 320 条时间轴/资产）。仍然 **1.17x 小于参考**（旧 1.20x），
+N=1/10/100 三个档我们依旧处处更少 ⇒ 这笔换算是值的。
+
+**已知限制**：`SpineGpuRuntimeData` 现在持有**指进 `SpineGpuAsset` 内部**的裸指针
+（`frames` / `curve` / `bezier`）⇒ 建完表之后那个 asset **不能**再让 `frames` /
+`curve_types` / `curve_bezier_index` 重新分配（**移动** asset 是安全的，`vector` 搬家不动堆元素）。
+这点写进了 `SpineGpuTimelineRt` 的注释。
+
+**剩下的（anim 还差 9%）**：`SpineGpuCurvePercentAt` 里的 `segment = cur / entries - 1`
+仍是**运行时整数除法**（`entries` 是 1/2/3/5/8，但编译器不知道 ⇒ 真 `udiv`，~20 周期）。
+下一步可以按 `entries` 分派成常量除法（`switch`），或者直接存"段号表的字节步长"。
+另外 deform 仍是最大的单块（§1.5 的 39%），但它现在是**按条**贵而不是算法问题。
 
 ---
 
@@ -320,10 +373,10 @@ cmake --build build --config Release --target SpineGpuBenchmark
 
 | 段 | 期望比值（参考/我们） |
 |---|---|
-| anim | **0.80~0.83x**（仍比参考慢，根源是 deform） |
+| anim | **0.90~0.93x**（仍比参考慢 ~9%；§1.6 之前是 0.77x） |
 | pose | ~0.82~0.86x |
 | geo | **≥ 2.3x**（我们更快，这块的立身之本） |
-| total | **1.43~1.46x**（我们更快） |
+| total | **1.50~1.54x**（我们更快；§1.6 之前是 1.38~1.40x） |
 | upload | 恒 2.62x（算出来的，不漂） |
 | **稳态每帧分配** | **我们 0 次 / 0 字节** |
 

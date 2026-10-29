@@ -510,7 +510,7 @@ SpineImportResult SpineGpuAnimationState::Apply(SpineGpuSkeletonState& skeleton,
                 SpineImportResult r;
                 if (static_cast<SpineTimelineType>(m_Asset.timelines[tl_index].type) == SpineTimelineType::kRotate)
                 {
-                    r = SpineGpuApplyRotateTimelineMixed(m_Asset, skeleton, tl_index, animation_time, mix,
+                    r = SpineGpuApplyRotateTimelineMixed(m_Asset, m_Data, skeleton, tl_index, animation_time, mix,
                                                          timeline_blend,
                                                          current.timelines_rotation.data() + (static_cast<size_t>(ii) << 1),
                                                          first_frame);
@@ -662,7 +662,8 @@ SpineImportResult SpineGpuAnimationState::ApplyMixingFrom(SpineGpuTrackEntry* to
             SpineImportResult r;
             if (type == SpineTimelineType::kRotate)
             {
-                r = SpineGpuApplyRotateTimelineMixed(m_Asset, skeleton, tl_index, animation_time, alpha, timeline_blend,
+                r = SpineGpuApplyRotateTimelineMixed(m_Asset, m_Data, skeleton, tl_index, animation_time, alpha,
+                                                     timeline_blend,
                                                      from->timelines_rotation.data() + (static_cast<size_t>(i) << 1),
                                                      first_frame);
             }

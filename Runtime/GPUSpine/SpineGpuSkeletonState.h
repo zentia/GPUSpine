@@ -140,6 +140,11 @@ struct SpineGpuRuntimeData
     std::vector<uint8_t> blob;                // chunk 1 的字节镜像
     std::vector<std::string> names;           // 规范化后的附件名（name_id 的下标空间）
 
+    // ---- 时间轴预解析（[timeline]，与 `asset.timelines` 一一对应）----
+    // 帧数组起点 / 每帧 float 数 / 曲线段表起点…… 全是"只由容器决定"的量 ⇒ 载入期算一次。
+    // 见 `SpineGpuTimelineRt` 上的注释（为什么搬、以及裸指针对 asset 生命周期的要求）。
+    std::vector<SpineGpuTimelineRt> timelines;
+
     std::vector<SpineGpuAttachRef> slot_setup;   // [slot] setup 附件（按"没有当前皮肤"解析）
 
     // ---- 换肤（`Skin::getAttachment(slot, name)`）----
@@ -273,6 +278,7 @@ SpineImportResult SpineGpuApplyAnimation(const SpineGpuAsset& asset, const Spine
 // 按"首帧定方向、之后检测跨零"的最短弧混合。`timelines_rotation` 指向该时间轴的那 **2** 个
 // float（`_timelinesRotation[i]` 与 `[i + 1]`）。放在这里而不是 AnimationState 里：它要读
 // 帧与曲线，和 RotateTimeline::apply 共用同一套取帧代码才不会两边漂移。
-SpineImportResult SpineGpuApplyRotateTimelineMixed(const SpineGpuAsset& asset, SpineGpuSkeletonState& state,
-                                                   uint32_t tl_index, float time, float alpha, SpineGpuMixBlend blend,
-                                                   float* timelines_rotation, bool first_frame);
+SpineImportResult SpineGpuApplyRotateTimelineMixed(const SpineGpuAsset& asset, const SpineGpuRuntimeData& data,
+                                                   SpineGpuSkeletonState& state, uint32_t tl_index, float time,
+                                                   float alpha, SpineGpuMixBlend blend, float* timelines_rotation,
+                                                   bool first_frame);

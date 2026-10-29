@@ -89,67 +89,31 @@ std::string TlName(uint32_t tl_index)
     return "第 " + std::to_string(tl_index) + " 条时间轴";
 }
 
-// 一条时间轴的帧数组（已校验区间）。
-struct FrameView
-{
-    const float* frames = nullptr;
-    uint32_t frame_count = 0;
-    uint32_t entries = 0;
-
-    float FirstTime() const { return frames[0]; }
-    float LastTime() const { return frames[static_cast<size_t>(frame_count - 1u) * entries]; }
-    // 末帧第 k 个值（k 从 1 起；= 参考实现的 `_frames[_frames.size() + PREV_*]`）
-    float Last(uint32_t k) const { return frames[static_cast<size_t>(frame_count - 1u) * entries + k]; }
-};
-
-SpineImportResult GetFrames(const SpineGpuAsset& asset, uint32_t tl_index, FrameView& out)
-{
-    if (tl_index >= asset.timelines.size())
-    {
-        return Fail("apply: 时间轴下标 " + std::to_string(tl_index) + " 越界");
-    }
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    const uint32_t entries = SpineTimelineEntries(static_cast<SpineTimelineType>(tl.type));
-    if (entries == 0 || tl.frame_count == 0)
-    {
-        return Fail("apply: " + TlName(tl_index) + "类型/帧数不自洽");
-    }
-    const uint64_t end = static_cast<uint64_t>(tl.frame_first) + static_cast<uint64_t>(tl.frame_count) * entries;
-    if (end > asset.frames.size())
-    {
-        return Fail("apply: " + TlName(tl_index) + "的帧区间越界");
-    }
-    out.frames = asset.frames.data() + tl.frame_first;
-    out.frame_count = tl.frame_count;
-    out.entries = entries;
-    return Ok();
-}
-
 // 两个值的曲线时间轴（translate / scale / shear / pathMix）在 `time` 处的原始插值结果
 // （还没乘 setup、没混合）。调用方保证 `time >= frames[0]`。
-SpineImportResult SampleTwo(const SpineGpuAsset& asset, uint32_t tl_index, const FrameView& fv, float time, float& x,
+SpineImportResult SampleTwo(const SpineGpuAsset& asset, uint32_t tl_index, const SpineGpuTimelineRt& rt, float time, float& x,
                             float& y)
 {
-    if (time >= fv.LastTime())
+    if (time >= rt.LastTime())
     {
-        x = fv.Last(1);
-        y = fv.Last(2);
+        x = rt.Last(1);
+        y = rt.Last(2);
         return Ok();
     }
-    const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, fv.entries, time);
+    const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
     float percent = 0.0f;
     const SpineImportResult cr =
-        SpineGpuCurvePercentAt(asset, asset.timelines[tl_index], tl_index, cur, time, percent);
+        SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
     if (!cr.ok)
     {
         return cr;
     }
-    const size_t prev = static_cast<size_t>(cur) - fv.entries;
-    x = fv.frames[prev + 1u];
-    y = fv.frames[prev + 2u];
+    const size_t prev = static_cast<size_t>(cur) - rt.entries;
+    x = rt.frames[prev + 1u];
+    y = rt.frames[prev + 2u];
     // `x += (_frames[frame + X] - x) * percent`（TranslateTimeline.cpp:101-102）
-    x += (fv.frames[cur + 1u] - x) * percent;
-    y += (fv.frames[cur + 2u] - y) * percent;
+    x += (rt.frames[cur + 1u] - x) * percent;
+    y += (rt.frames[cur + 2u] - y) * percent;
     return Ok();
 }
 
@@ -159,17 +123,16 @@ SpineImportResult SampleTwo(const SpineGpuAsset& asset, uint32_t tl_index, const
 
 // RotateTimeline.cpp:49-106
 SpineImportResult ApplyRotate(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
-                              const FrameView& fv, float time, float alpha, SpineGpuMixBlend blend)
+                              const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.bones.size())
+    if (rt.target >= st.bones.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（rotate）的骨骼下标越界");
     }
-    SpineGpuBoneState& bone = st.bones[tl.target];
-    const float setup = asset.bones[tl.target].rotation;
+    SpineGpuBoneState& bone = st.bones[rt.target];
+    const float setup = asset.bones[rt.target].rotation;
 
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -188,9 +151,9 @@ SpineImportResult ApplyRotate(const SpineGpuAsset& asset, SpineGpuSkeletonState&
         return Ok();
     }
 
-    if (time >= fv.LastTime())
+    if (time >= rt.LastTime())
     {
-        float r = fv.Last(1);
+        float r = rt.Last(1);
         switch (blend)
         {
             case SpineGpuMixBlend::kSetup:
@@ -208,15 +171,15 @@ SpineImportResult ApplyRotate(const SpineGpuAsset& asset, SpineGpuSkeletonState&
         return Ok();
     }
 
-    const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, fv.entries, time);
-    const float prev_rotation = fv.frames[static_cast<size_t>(cur) - 1u];   // frame + PREV_ROTATION(-1)
+    const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
+    const float prev_rotation = rt.frames[static_cast<size_t>(cur) - 1u];   // frame + PREV_ROTATION(-1)
     float percent = 0.0f;
-    const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tl_index, cur, time, percent);
+    const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
     if (!cr.ok)
     {
         return cr;
     }
-    float r = fv.frames[cur + 1u] - prev_rotation;
+    float r = rt.frames[cur + 1u] - prev_rotation;
     r = prev_rotation + SpineGpuWrapDegrees(r) * percent;
     switch (blend)
     {
@@ -236,22 +199,21 @@ SpineImportResult ApplyRotate(const SpineGpuAsset& asset, SpineGpuSkeletonState&
 
 // TranslateTimeline.cpp:57-109 与 ShearTimeline.cpp:52-104：两者逐行同构，只是写的字段不同。
 SpineImportResult ApplyTranslateOrShear(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
-                                        const FrameView& fv, float time, float alpha, SpineGpuMixBlend blend,
+                                        const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend,
                                         bool shear)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.bones.size())
+    if (rt.target >= st.bones.size())
     {
         return Fail("apply: " + TlName(tl_index) + "的骨骼下标越界");
     }
-    SpineGpuBoneState& bone = st.bones[tl.target];
-    const SpineGpuBone& data = asset.bones[tl.target];
+    SpineGpuBoneState& bone = st.bones[rt.target];
+    const SpineGpuBone& data = asset.bones[rt.target];
     float& bx = shear ? bone.shear_x : bone.x;
     float& by = shear ? bone.shear_y : bone.y;
     const float dx = shear ? data.shear_x : data.x;
     const float dy = shear ? data.shear_y : data.y;
 
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -271,7 +233,7 @@ SpineImportResult ApplyTranslateOrShear(const SpineGpuAsset& asset, SpineGpuSkel
 
     float x = 0.0f;
     float y = 0.0f;
-    const SpineImportResult sr = SampleTwo(asset, tl_index, fv, time, x, y);
+    const SpineImportResult sr = SampleTwo(asset, tl_index, rt, time, x, y);
     if (!sr.ok)
     {
         return sr;
@@ -301,18 +263,17 @@ SpineImportResult ApplyTranslateOrShear(const SpineGpuAsset& asset, SpineGpuSkel
 //    "符号取谁"（混出取 setup / 当前的符号，混入取关键帧的符号）—— 写反了只在负缩放
 //    （镜像）骨骼上露出来，表现是混合途中突然翻面。
 SpineImportResult ApplyScale(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
-                             const FrameView& fv, float time, float alpha, SpineGpuMixBlend blend,
+                             const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend,
                              SpineGpuMixDirection direction)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.bones.size())
+    if (rt.target >= st.bones.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（scale）的骨骼下标越界");
     }
-    SpineGpuBoneState& bone = st.bones[tl.target];
-    const SpineGpuBone& data = asset.bones[tl.target];
+    SpineGpuBoneState& bone = st.bones[rt.target];
+    const SpineGpuBone& data = asset.bones[rt.target];
 
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -332,25 +293,25 @@ SpineImportResult ApplyScale(const SpineGpuAsset& asset, SpineGpuSkeletonState& 
 
     float x = 0.0f;
     float y = 0.0f;
-    if (time >= fv.LastTime())
+    if (time >= rt.LastTime())
     {
-        x = fv.Last(1) * data.scale_x;
-        y = fv.Last(2) * data.scale_y;
+        x = rt.Last(1) * data.scale_x;
+        y = rt.Last(2) * data.scale_y;
     }
     else
     {
-        const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, fv.entries, time);
+        const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
         float percent = 0.0f;
-        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tl_index, cur, time, percent);
+        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
         if (!cr.ok)
         {
             return cr;
         }
-        const size_t prev = static_cast<size_t>(cur) - fv.entries;
-        x = fv.frames[prev + 1u];
-        y = fv.frames[prev + 2u];
-        x = (x + (fv.frames[cur + 1u] - x) * percent) * data.scale_x;
-        y = (y + (fv.frames[cur + 2u] - y) * percent) * data.scale_y;
+        const size_t prev = static_cast<size_t>(cur) - rt.entries;
+        x = rt.frames[prev + 1u];
+        y = rt.frames[prev + 2u];
+        x = (x + (rt.frames[cur + 1u] - x) * percent) * data.scale_x;
+        y = (y + (rt.frames[cur + 2u] - y) * percent) * data.scale_y;
     }
 
     if (alpha == 1.0f)
@@ -429,19 +390,18 @@ SpineImportResult ApplyScale(const SpineGpuAsset& asset, SpineGpuSkeletonState& 
 
 // ColorTimeline.cpp:64-113 / TwoColorTimeline.cpp:68-149
 SpineImportResult ApplyColor(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
-                             const FrameView& fv, float time, float alpha, SpineGpuMixBlend blend, bool two)
+                             const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend, bool two)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.slots.size())
+    if (rt.target >= st.slots.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（颜色）的槽位下标越界");
     }
-    SpineGpuSlotState& slot = st.slots[tl.target];
-    const SpineGpuSlot& data = asset.slots[tl.target];
+    SpineGpuSlotState& slot = st.slots[rt.target];
+    const SpineGpuSlot& data = asset.slots[rt.target];
     float* color = slot.color;
     float* dark = slot.dark;
 
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -479,27 +439,27 @@ SpineImportResult ApplyColor(const SpineGpuAsset& asset, SpineGpuSkeletonState& 
 
     float v[7] = {0, 0, 0, 0, 0, 0, 0};
     const uint32_t nv = two ? 7u : 4u;
-    if (time >= fv.LastTime())
+    if (time >= rt.LastTime())
     {
         for (uint32_t k = 0; k < nv; ++k)
         {
-            v[k] = fv.Last(k + 1u);
+            v[k] = rt.Last(k + 1u);
         }
     }
     else
     {
-        const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, fv.entries, time);
+        const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
         float percent = 0.0f;
-        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tl_index, cur, time, percent);
+        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
         if (!cr.ok)
         {
             return cr;
         }
-        const size_t prev = static_cast<size_t>(cur) - fv.entries;
+        const size_t prev = static_cast<size_t>(cur) - rt.entries;
         for (uint32_t k = 0; k < nv; ++k)
         {
-            v[k] = fv.frames[prev + 1u + k];
-            v[k] += (fv.frames[cur + 1u + k] - v[k]) * percent;
+            v[k] = rt.frames[prev + 1u + k];
+            v[k] += (rt.frames[cur + 1u + k] - v[k]) * percent;
         }
     }
 
@@ -532,36 +492,35 @@ SpineImportResult ApplyColor(const SpineGpuAsset& asset, SpineGpuSkeletonState& 
 
 // AttachmentTimeline.cpp:53-80 —— **alpha 不参与**（附件不能"混一半"）。
 SpineImportResult ApplyAttachment(const SpineGpuAsset& asset, const SpineGpuRuntimeData& data,
-                                  SpineGpuSkeletonState& st, uint32_t tl_index, const FrameView& fv, float time,
+                                  SpineGpuSkeletonState& st, uint32_t tl_index, const SpineGpuTimelineRt& rt, float time,
                                   SpineGpuMixBlend blend, SpineGpuMixDirection direction)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.slots.size() || tl.target >= data.slot_setup.size())
+    if (rt.target >= st.slots.size() || rt.target >= data.slot_setup.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（attachment）的槽位下标越界");
     }
-    SpineGpuSlotState& slot = st.slots[tl.target];
+    SpineGpuSlotState& slot = st.slots[rt.target];
     // `skeleton.getAttachment(slotIndex, name)`：按骨架**当前**皮肤解析
     const auto attach = [&](const SpineGpuAttachRef& ref) {
-        SpineGpuSetSlotAttachment(slot, SpineGpuResolveAttachment(data, st.skin, tl.target, ref));
+        SpineGpuSetSlotAttachment(slot, SpineGpuResolveAttachment(data, st.skin, rt.target, ref));
     };
     if (direction == SpineGpuMixDirection::kOut && blend == SpineGpuMixBlend::kSetup)
     {
-        attach(data.slot_setup[tl.target]);
+        attach(data.slot_setup[rt.target]);
         return Ok();
     }
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         if (blend == SpineGpuMixBlend::kSetup || blend == SpineGpuMixBlend::kFirst)
         {
-            attach(data.slot_setup[tl.target]);
+            attach(data.slot_setup[rt.target]);
         }
         return Ok();
     }
-    uint32_t frame_index = fv.frame_count - 1u;
-    if (time < fv.LastTime())
+    uint32_t frame_index = rt.frame_count - 1u;
+    if (time < rt.LastTime())
     {
-        frame_index = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, 1u, time) - 1u;
+        frame_index = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, 1u, time) - 1u;
     }
     const size_t ri = static_cast<size_t>(data.timeline_ref_first[tl_index]) + frame_index;
     if (ri >= data.attach_refs.size())
@@ -582,7 +541,7 @@ inline void ResetDrawOrder(SpineGpuSkeletonState& st)
 
 // DrawOrderTimeline.cpp:53-97 —— **alpha 不参与**。
 SpineImportResult ApplyDrawOrder(const SpineGpuRuntimeData& data, SpineGpuSkeletonState& st, uint32_t tl_index,
-                                 const FrameView& fv, float time, SpineGpuMixBlend blend,
+                                 const SpineGpuTimelineRt& rt, float time, SpineGpuMixBlend blend,
                                  SpineGpuMixDirection direction)
 {
     if (direction == SpineGpuMixDirection::kOut && blend == SpineGpuMixBlend::kSetup)
@@ -590,7 +549,7 @@ SpineImportResult ApplyDrawOrder(const SpineGpuRuntimeData& data, SpineGpuSkelet
         ResetDrawOrder(st);
         return Ok();
     }
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         if (blend == SpineGpuMixBlend::kSetup || blend == SpineGpuMixBlend::kFirst)
         {
@@ -598,10 +557,10 @@ SpineImportResult ApplyDrawOrder(const SpineGpuRuntimeData& data, SpineGpuSkelet
         }
         return Ok();
     }
-    uint32_t frame = fv.frame_count - 1u;
-    if (time < fv.LastTime())
+    uint32_t frame = rt.frame_count - 1u;
+    if (time < rt.LastTime())
     {
-        frame = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, 1u, time) - 1u;
+        frame = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, 1u, time) - 1u;
     }
     const size_t fi = static_cast<size_t>(data.draw_order_first[tl_index]) + frame;
     if (fi >= data.draw_order_frame_pos.size())
@@ -632,16 +591,15 @@ SpineImportResult ApplyDrawOrder(const SpineGpuRuntimeData& data, SpineGpuSkelet
 
 // PathConstraintPositionTimeline.cpp:59-100
 SpineImportResult ApplyPathPosition(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
-                                    const FrameView& fv, float time, float alpha, SpineGpuMixBlend blend)
+                                    const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.path_position.size())
+    if (rt.target >= st.path_position.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（pathPosition）的约束下标越界");
     }
-    float& pos = st.path_position[tl.target];
-    const float setup = asset.paths[tl.target].position;
-    if (time < fv.FirstTime())
+    float& pos = st.path_position[rt.target];
+    const float setup = asset.paths[rt.target].position;
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -656,21 +614,21 @@ SpineImportResult ApplyPathPosition(const SpineGpuAsset& asset, SpineGpuSkeleton
         }
     }
     float position;
-    if (time >= fv.LastTime())
+    if (time >= rt.LastTime())
     {
-        position = fv.Last(1);
+        position = rt.Last(1);
     }
     else
     {
-        const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, fv.entries, time);
+        const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
         float percent = 0.0f;
-        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tl_index, cur, time, percent);
+        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
         if (!cr.ok)
         {
             return cr;
         }
-        position = fv.frames[static_cast<size_t>(cur) - fv.entries + 1u];
-        position += (fv.frames[cur + 1u] - position) * percent;
+        position = rt.frames[static_cast<size_t>(cur) - rt.entries + 1u];
+        position += (rt.frames[cur + 1u] - position) * percent;
     }
     if (blend == SpineGpuMixBlend::kSetup)
     {
@@ -685,18 +643,17 @@ SpineImportResult ApplyPathPosition(const SpineGpuAsset& asset, SpineGpuSkeleton
 
 // PathConstraintMixTimeline.cpp:59-116
 SpineImportResult ApplyPathMix(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
-                               const FrameView& fv, float time, float alpha, SpineGpuMixBlend blend)
+                               const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= st.path_rotate_mix.size())
+    if (rt.target >= st.path_rotate_mix.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（pathMix）的约束下标越界");
     }
-    float& rm = st.path_rotate_mix[tl.target];
-    float& tm = st.path_translate_mix[tl.target];
-    const float srm = asset.paths[tl.target].rotate_mix;
-    const float stm = asset.paths[tl.target].translate_mix;
-    if (time < fv.FirstTime())
+    float& rm = st.path_rotate_mix[rt.target];
+    float& tm = st.path_translate_mix[rt.target];
+    const float srm = asset.paths[rt.target].rotate_mix;
+    const float stm = asset.paths[rt.target].translate_mix;
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -714,7 +671,7 @@ SpineImportResult ApplyPathMix(const SpineGpuAsset& asset, SpineGpuSkeletonState
     }
     float rotate = 0.0f;
     float translate = 0.0f;
-    const SpineImportResult sr = SampleTwo(asset, tl_index, fv, time, rotate, translate);
+    const SpineImportResult sr = SampleTwo(asset, tl_index, rt, time, rotate, translate);
     if (!sr.ok)
     {
         return sr;
@@ -846,19 +803,18 @@ inline const float* RigidSetupAt(const SpineGpuAsset& asset, size_t byte_offset)
 
 // DeformTimeline.cpp:62-258
 SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeData& data,
-                              SpineGpuSkeletonState& st, uint32_t tl_index, const FrameView& fv, float time,
+                              SpineGpuSkeletonState& st, uint32_t tl_index, const SpineGpuTimelineRt& rt, float time,
                               float alpha, SpineGpuMixBlend blend)
 {
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
 
     // ---- 解析"作用于谁"：槽位 + `applyDeform` 判据（:73-79）----
     uint32_t slot_index = 0;
     uint32_t deform_len = 0;
     bool rigid = false;
     const float* setup = nullptr;   // rigid 的 setup 顶点（参考实现的 `attachment->getVertices()`）
-    if ((tl.target & SpineGpuConstants::kDeformTargetPathBit) != 0)
+    if ((rt.target & SpineGpuConstants::kDeformTargetPathBit) != 0)
     {
-        const uint32_t k = tl.target & SpineGpuConstants::kDeformTargetIndexMask;
+        const uint32_t k = rt.target & SpineGpuConstants::kDeformTargetIndexMask;
         if (k >= asset.path_attachments.size())
         {
             return Fail("apply: " + TlName(tl_index) + "指向越界的 path 附件 " + std::to_string(k));
@@ -885,11 +841,11 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
             setup = asset.path_vertices.data() + att.vertex_offset;
         }
     }
-    else if ((tl.target & SpineGpuConstants::kDeformTargetClipBit) != 0)
+    else if ((rt.target & SpineGpuConstants::kDeformTargetClipBit) != 0)
     {
         // v15：裁剪附件的 deform（改的是裁剪多边形；`VertexAttachment::applyDeform` 对非 mesh
         // 就是 `this == source`）
-        const uint32_t k = tl.target & SpineGpuConstants::kDeformTargetIndexMask;
+        const uint32_t k = rt.target & SpineGpuConstants::kDeformTargetIndexMask;
         if (k >= asset.clip_polygons.size())
         {
             return Fail("apply: " + TlName(tl_index) + "指向越界的裁剪多边形 " + std::to_string(k));
@@ -919,11 +875,11 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
     }
     else
     {
-        if (tl.target >= asset.attachment_records.size())
+        if (rt.target >= asset.attachment_records.size())
         {
-            return Fail("apply: " + TlName(tl_index) + "指向越界的附件记录 " + std::to_string(tl.target));
+            return Fail("apply: " + TlName(tl_index) + "指向越界的附件记录 " + std::to_string(rt.target));
         }
-        const SpineGpuAttachmentRecord& rec = asset.attachment_records[tl.target];
+        const SpineGpuAttachmentRecord& rec = asset.attachment_records[rt.target];
         slot_index = rec.slot_index;
         if (slot_index >= st.slots.size())
         {
@@ -961,7 +917,7 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
     }
     const size_t n = deform_len;
 
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         switch (blend)
         {
@@ -1008,10 +964,10 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
     float* __restrict vr = vertices.data();
     const float* __restrict sr = setup;   // weighted（非 rigid）时是 nullptr，那些分支不解引用它
 
-    if (time >= fv.LastTime())
+    if (time >= rt.LastTime())
     {
         std::vector<float>& last = t_deform_scratch.prev;   // 复用（这条分支不会同时用 prev）
-        if (!ExpandDeformFrame(asset, data, tl_index, fv.frame_count - 1u, deform_len, rigid ? setup : nullptr, last))
+        if (!ExpandDeformFrame(asset, data, tl_index, rt.frame_count - 1u, deform_len, rigid ? setup : nullptr, last))
         {
             return Fail("apply: " + TlName(tl_index) + "（deform）的帧超出 deform 长度");
         }
@@ -1090,9 +1046,9 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
     }
 
     // 插值（:182-257）
-    const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, 1u, time);
+    const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, 1u, time);
     float percent = 0.0f;
-    const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tl_index, cur, time, percent);
+    const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
     if (!cr.ok)
     {
         return cr;
@@ -1270,17 +1226,77 @@ SpineImportResult SpineGpuBuildRuntimeData(const SpineGpuAsset& asset, SpineGpuR
     out.draw_order_first.assign(tl_count, 0u);
     out.deform_frame_first.assign(tl_count, 0u);
     out.property_key.assign(tl_count, 0u);
+    out.timelines.assign(tl_count, SpineGpuTimelineRt {});
     const std::vector<uint8_t>& payload = asset.timeline_payload;
     for (uint32_t ti = 0; ti < tl_count; ++ti)
     {
         const SpineGpuTimeline& tl = asset.timelines[ti];
         const SpineTimelineType type = static_cast<SpineTimelineType>(tl.type);
-        FrameView fv;
         {
-            const SpineImportResult fr = GetFrames(asset, ti, fv);
-            if (!fr.ok)
+            // ---- 帧数组 / 曲线段的预解析（apply 每帧每条都要用）----
+            // 类型 → 每帧 float 数、区间越界、段表地址、bezier 表下标，全部在这里算一次。
+            // 以前这些全在 `GetFrames()` + `SpineGpuCurvePercentAt()` 里每次重算
+            // （PERF_ACCEPTANCE §1.5：与参考实现的差是"每条 apply 的固定开销"，不是某类写坏了）。
+            const uint32_t entries = SpineTimelineEntries(type);
+            if (entries == 0)
             {
-                return fr;
+                return Fail("runtime: " + TlName(ti) + "的类型 " + std::to_string(tl.type) + " 不认识");
+            }
+            if (tl.frame_count == 0)
+            {
+                return Fail("runtime: " + TlName(ti) + "的帧数为 0");
+            }
+            const uint64_t end =
+                static_cast<uint64_t>(tl.frame_first) + static_cast<uint64_t>(tl.frame_count) * entries;
+            if (end > asset.frames.size())
+            {
+                return Fail("runtime: " + TlName(ti) + "的帧区间越界");
+            }
+            SpineGpuTimelineRt& rt = out.timelines[ti];
+            rt.frames = asset.frames.data() + tl.frame_first;
+            rt.frame_count = tl.frame_count;
+            rt.entries = entries;
+            rt.target = tl.target;
+            rt.type = tl.type;
+
+            if (SpineTimelineHasCurve(type) && tl.frame_count >= 2u)
+            {
+                const uint32_t segments = tl.frame_count - 1u;
+                if (static_cast<size_t>(tl.curve_first) + segments > asset.curve_types.size())
+                {
+                    return Fail("runtime: " + TlName(ti) + "的曲线段区间越界");
+                }
+                // ⚠️ `curve_bezier_index` 是**派生**数据（加载后由 `SpineGpuBuildCurveCache()` 建）。
+                //    没建就在这里报错，绝不退回"从段 0 扫一遍数 bezier"—— 那只慢不报错，
+                //    而"慢"正是这类 bug 唯一的表现。
+                if (asset.curve_bezier_index.size() != asset.curve_types.size())
+                {
+                    return Fail("runtime: " + TlName(ti) +
+                                " 要读曲线，但曲线缓存没建（烘焙 / 读容器后必须调 "
+                                "SpineGpuBuildCurveCache）—— 不在这里悄悄退化成 O(段数) 的慢路径");
+                }
+                rt.curve = asset.curve_types.data() + tl.curve_first;
+                rt.bezier = asset.curve_bezier_index.data() + tl.curve_first;
+                // 逐段校验 bezier 表下标（载入期一次 ⇒ 求值热路上不用再查边界）
+                for (uint32_t s = 0; s < segments; ++s)
+                {
+                    if (rt.curve[s] != static_cast<uint8_t>(SpineCurveType::kBezier))
+                    {
+                        continue;
+                    }
+                    const uint32_t bi = rt.bezier[s];
+                    if (bi == kSpineNoBezierIndex)
+                    {
+                        return Fail("runtime: " + TlName(ti) + "第 " + std::to_string(s) +
+                                    " 段标了 bezier 但缓存里没有控制点");
+                    }
+                    // bezier 表下标越界（载入期挡住；求值时不查）
+                    if (static_cast<size_t>(bi) * kSpineBezierTableStride + kSpineBezierTableStride >
+                        asset.bezier_tables.size())
+                    {
+                        return Fail("runtime: " + TlName(ti) + "的 bezier 表下标越界");
+                    }
+                }
             }
         }
         // 属性身份：(类型, 目标)。drawOrder / event 全骨架只有一个属性（参考实现不加目标）。
@@ -1755,39 +1771,35 @@ SpineImportResult SpineGpuApplyTimeline(const SpineGpuAsset& asset, const SpineG
                                         float alpha, SpineGpuMixBlend blend, SpineGpuMixDirection direction)
 {
     (void)last_time;   // 只有 event 时间轴读它，event 不改状态
-    FrameView fv;
+    if (tl_index >= data.timelines.size())
     {
-        const SpineImportResult fr = GetFrames(asset, tl_index, fv);
-        if (!fr.ok)
-        {
-            return fr;
-        }
+        return Fail("apply: 时间轴下标 " + std::to_string(tl_index) + " 越界");
     }
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    switch (static_cast<SpineTimelineType>(tl.type))
+    const SpineGpuTimelineRt& rt = data.timelines[tl_index];   // 载入期预解析好，这里只读
+    switch (static_cast<SpineTimelineType>(rt.type))
     {
         case SpineTimelineType::kRotate:
-            return ApplyRotate(asset, state, tl_index, fv, time, alpha, blend);
+            return ApplyRotate(asset, state, tl_index, rt, time, alpha, blend);
         case SpineTimelineType::kTranslate:
-            return ApplyTranslateOrShear(asset, state, tl_index, fv, time, alpha, blend, false);
+            return ApplyTranslateOrShear(asset, state, tl_index, rt, time, alpha, blend, false);
         case SpineTimelineType::kShear:
-            return ApplyTranslateOrShear(asset, state, tl_index, fv, time, alpha, blend, true);
+            return ApplyTranslateOrShear(asset, state, tl_index, rt, time, alpha, blend, true);
         case SpineTimelineType::kScale:
-            return ApplyScale(asset, state, tl_index, fv, time, alpha, blend, direction);
+            return ApplyScale(asset, state, tl_index, rt, time, alpha, blend, direction);
         case SpineTimelineType::kColor:
-            return ApplyColor(asset, state, tl_index, fv, time, alpha, blend, false);
+            return ApplyColor(asset, state, tl_index, rt, time, alpha, blend, false);
         case SpineTimelineType::kTwoColor:
-            return ApplyColor(asset, state, tl_index, fv, time, alpha, blend, true);
+            return ApplyColor(asset, state, tl_index, rt, time, alpha, blend, true);
         case SpineTimelineType::kAttachment:
-            return ApplyAttachment(asset, data, state, tl_index, fv, time, blend, direction);
+            return ApplyAttachment(asset, data, state, tl_index, rt, time, blend, direction);
         case SpineTimelineType::kDrawOrder:
-            return ApplyDrawOrder(data, state, tl_index, fv, time, blend, direction);
+            return ApplyDrawOrder(data, state, tl_index, rt, time, blend, direction);
         case SpineTimelineType::kDeform:
-            return ApplyDeform(asset, data, state, tl_index, fv, time, alpha, blend);
+            return ApplyDeform(asset, data, state, tl_index, rt, time, alpha, blend);
         case SpineTimelineType::kPathConstraintPosition:
-            return ApplyPathPosition(asset, state, tl_index, fv, time, alpha, blend);
+            return ApplyPathPosition(asset, state, tl_index, rt, time, alpha, blend);
         case SpineTimelineType::kPathConstraintMix:
-            return ApplyPathMix(asset, state, tl_index, fv, time, alpha, blend);
+            return ApplyPathMix(asset, state, tl_index, rt, time, alpha, blend);
         case SpineTimelineType::kEvent:
             return Ok();   // 事件不改渲染状态（本实现不派发事件）
         case SpineTimelineType::kIkConstraint:
@@ -1795,10 +1807,10 @@ SpineImportResult SpineGpuApplyTimeline(const SpineGpuAsset& asset, const SpineG
         case SpineTimelineType::kPathConstraintSpacing:
             // 这三类**会改姿势**，本阶段不做 ⇒ 显式报错，不能静默跳过
             // （实测 0 / 782 个资产用到，所以不会真的挡住任何资产）。
-            return Fail("apply: " + TlName(tl_index) + "类型 " + std::to_string(tl.type) +
+            return Fail("apply: " + TlName(tl_index) + "类型 " + std::to_string(rt.type) +
                         " 本阶段不做（会改姿势，跳过会得到静默错的姿势）");
     }
-    return Fail("apply: " + TlName(tl_index) + "类型 " + std::to_string(tl.type) + " 不认识");
+    return Fail("apply: " + TlName(tl_index) + "类型 " + std::to_string(rt.type) + " 不认识");
 }
 
 SpineImportResult SpineGpuApplyAnimation(const SpineGpuAsset& asset, const SpineGpuRuntimeData& data,
@@ -1832,38 +1844,35 @@ SpineImportResult SpineGpuApplyAnimation(const SpineGpuAsset& asset, const Spine
     return Ok();
 }
 
-SpineImportResult SpineGpuApplyRotateTimelineMixed(const SpineGpuAsset& asset, SpineGpuSkeletonState& state,
-                                                   uint32_t tl_index, float time, float alpha, SpineGpuMixBlend blend,
-                                                   float* timelines_rotation, bool first_frame)
+SpineImportResult SpineGpuApplyRotateTimelineMixed(const SpineGpuAsset& asset, const SpineGpuRuntimeData& data,
+                                                   SpineGpuSkeletonState& state, uint32_t tl_index, float time,
+                                                   float alpha, SpineGpuMixBlend blend, float* timelines_rotation,
+                                                   bool first_frame)
 {
     if (first_frame)
     {
         timelines_rotation[0] = 0.0f;
     }
-    FrameView fv;
+    if (tl_index >= data.timelines.size())
     {
-        const SpineImportResult fr = GetFrames(asset, tl_index, fv);
-        if (!fr.ok)
-        {
-            return fr;
-        }
+        return Fail("apply: 时间轴下标 " + std::to_string(tl_index) + " 越界");
     }
+    const SpineGpuTimelineRt& rt = data.timelines[tl_index];
     if (alpha == 1.0f)
     {
         // `rotateTimeline->apply(skeleton, 0, time, NULL, 1, blend, MixDirection_In)`（:642-645）
-        return ApplyRotate(asset, state, tl_index, fv, time, 1.0f, blend);
+        return ApplyRotate(asset, state, tl_index, rt, time, 1.0f, blend);
     }
 
-    const SpineGpuTimeline& tl = asset.timelines[tl_index];
-    if (tl.target >= state.bones.size())
+    if (rt.target >= state.bones.size())
     {
         return Fail("apply: " + TlName(tl_index) + "（rotate）的骨骼下标越界");
     }
-    SpineGpuBoneState& bone = state.bones[tl.target];
-    const float setup = asset.bones[tl.target].rotation;
+    SpineGpuBoneState& bone = state.bones[rt.target];
+    const float setup = asset.bones[rt.target].rotation;
     float r1;
     float r2;
-    if (time < fv.FirstTime())
+    if (time < rt.FirstTime())
     {
         // ⚠️ 照抄参考实现的 switch 贯穿（:651-659）：Setup 写完**贯穿进 default 直接 return**；
         //    只有 First 走到下面的混合。
@@ -1883,21 +1892,21 @@ SpineImportResult SpineGpuApplyRotateTimelineMixed(const SpineGpuAsset& asset, S
     else
     {
         r1 = blend == SpineGpuMixBlend::kSetup ? setup : bone.rotation;
-        if (time >= fv.LastTime())
+        if (time >= rt.LastTime())
         {
-            r2 = setup + fv.Last(1);
+            r2 = setup + rt.Last(1);
         }
         else
         {
-            const uint32_t cur = SpineGpuBinarySearchFrames(fv.frames, fv.frame_count, fv.entries, time);
-            const float prev_rotation = fv.frames[static_cast<size_t>(cur) - 1u];
+            const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
+            const float prev_rotation = rt.frames[static_cast<size_t>(cur) - 1u];
             float percent = 0.0f;
-            const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tl_index, cur, time, percent);
+            const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
             if (!cr.ok)
             {
                 return cr;
             }
-            r2 = fv.frames[cur + 1u] - prev_rotation;
+            r2 = rt.frames[cur + 1u] - prev_rotation;
             r2 = SpineGpuWrapDegrees(r2);
             r2 = prev_rotation + r2 * percent + setup;
             r2 = SpineGpuWrapDegrees(r2);

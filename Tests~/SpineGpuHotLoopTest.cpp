@@ -324,12 +324,17 @@ int main()
         Check(tli != 0xFFFFFFFFu, "缓存: 找到带 bezier 的 rotate 时间轴");
         if (tli != 0xFFFFFFFFu)
         {
+            // 走**真实**的预解析路径（载入期 `SpineGpuBuildRuntimeData`）
+            SpineGpuRuntimeData rtd;
+            Check(SpineGpuBuildRuntimeData(asset, rtd).ok, "缓存: 建查找表");
+            const SpineGpuTimelineRt& rt = rtd.timelines[tli];
             const SpineGpuTimeline& tl = asset.timelines[tli];
             const uint32_t entries = SpineTimelineEntries(SpineTimelineType::kRotate);
-            const uint32_t cur =
-                SpineGpuBinarySearchFrames(asset.frames.data() + tl.frame_first, tl.frame_count, entries, 0.75f);
+            Check(rt.frames == asset.frames.data() + tl.frame_first, "预解析: frames 指向本时间轴的第 0 帧");
+            Check(rt.curve == asset.curve_types.data() + tl.curve_first, "预解析: curve 指向本时间轴的段 0");
+            const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, entries, 0.75f);
             float got = -1.0f;
-            const SpineImportResult cr = SpineGpuCurvePercentAt(asset, tl, tli, cur, 0.75f, got);
+            const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tli, cur, 0.75f, got);
             Check(cr.ok, "缓存: bezier 段求值成功");
             if (!cr.ok)
             {
@@ -340,11 +345,12 @@ int main()
 
             // 没建缓存 ⇒ **必须报错**。静默退回"从段 0 扫一遍"只是慢，而"慢"正是这类
             // bug 的唯一表现 ⇒ 让它变成一条错误信息。
+            // ⚠️ 预解析之后这条检查**前移到载入期**（求值热路上不再查 `curve_bezier_index.size()`）。
             SpineGpuAsset nocache = asset;
             nocache.curve_bezier_index.clear();
-            float dummy = -1.0f;
-            const SpineImportResult nr = SpineGpuCurvePercentAt(nocache, tl, tli, cur, 0.75f, dummy);
-            Check(!nr.ok, "缓存: 没建缓存 ⇒ 报错（不静默退回 O(段数) 的慢路径）");
+            SpineGpuRuntimeData ndata;
+            const SpineImportResult nr = SpineGpuBuildRuntimeData(nocache, ndata);
+            Check(!nr.ok, "缓存: 没建缓存 ⇒ 建查找表就报错（不静默退回 O(段数) 的慢路径）");
             std::printf("  (预期报错) %s\n", nr.error.c_str());
         }
 

@@ -5213,13 +5213,24 @@ int main(int argc, char** argv)
             Check(tli != 0xFFFFFFFFu, "缓存: 找到带 bezier 的 rotate 时间轴");
             if (tli != 0xFFFFFFFFu)
             {
+                // 走**真实**的预解析路径（载入期 `SpineGpuBuildRuntimeData`）拿记录，
+                // 顺带把"预解析出来的东西必须等于按容器现算的"钉住。
+                SpineGpuRuntimeData rtd;
+                Check(SpineGpuBuildRuntimeData(asset, rtd).ok, "缓存: 建查找表");
+                const SpineGpuTimelineRt& rt = rtd.timelines[tli];
                 const SpineGpuTimeline& tl = asset.timelines[tli];
                 const uint32_t entries = SpineTimelineEntries(SpineTimelineType::kRotate);
-                const float* frames = asset.frames.data() + tl.frame_first;
-                const uint32_t cur = SpineGpuBinarySearchFrames(frames, tl.frame_count, entries, 0.75f);
+                CheckEq(static_cast<long long>(rt.entries), static_cast<long long>(entries), "预解析: entries = 2");
+                CheckEq(static_cast<long long>(rt.frame_count), static_cast<long long>(tl.frame_count),
+                        "预解析: frame_count");
+                Check(rt.frames == asset.frames.data() + tl.frame_first, "预解析: frames 指向本时间轴的第 0 帧");
+                Check(rt.curve == asset.curve_types.data() + tl.curve_first, "预解析: curve 指向本时间轴的段 0");
+                Check(rt.bezier == asset.curve_bezier_index.data() + tl.curve_first,
+                      "预解析: bezier 指向本时间轴的段 0");
+                const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, entries, 0.75f);
                 CheckEq(static_cast<long long>(cur / entries), 2LL, "缓存: 0.75 落在第 1 段（帧 1 → 帧 2）");
                 float got = -1.0f;
-                const SpineImportResult cpr = SpineGpuCurvePercentAt(asset, tl, tli, cur, 0.75f, got);
+                const SpineImportResult cpr = SpineGpuCurvePercentAt(asset, rt, tli, cur, 0.75f, got);
                 Check(cpr.ok, "缓存: bezier 段求值成功");
                 if (!cpr.ok)
                 {
@@ -5232,31 +5243,17 @@ int main(int argc, char** argv)
 
         // 缓存没建 ⇒ **必须报错**。静默退回"从段 0 扫一遍"只是慢，而"慢"正是这类 bug 的
         // 唯一表现 —— 让它变成一条错误信息。
+        // ⚠️ 这条检查在预解析之后**前移到了载入期**（`SpineGpuBuildRuntimeData`）：求值热路上
+        //    不再查 `curve_bezier_index.size()`，所以"没建缓存"现在表现为建表失败。
+        //    （求值侧仍然保留"这段标了 bezier 但表里没有"的检查 —— 那条是 `kSpineNoBezierIndex`
+        //    的语义，读下去就是越界。）
         {
             SpineGpuAsset nocache = asset;
             nocache.curve_bezier_index.clear();
-            uint32_t tli = 0xFFFFFFFFu;
-            for (uint32_t i = 0; i < nocache.timelines.size(); ++i)
-            {
-                const SpineGpuTimeline& t = nocache.timelines[i];
-                if (t.type == static_cast<uint16_t>(SpineTimelineType::kRotate) && t.frame_count >= 3u &&
-                    t.bezier_count >= 1u)
-                {
-                    tli = i;
-                    break;
-                }
-            }
-            if (tli != 0xFFFFFFFFu)
-            {
-                const SpineGpuTimeline& tl = nocache.timelines[tli];
-                const uint32_t entries = SpineTimelineEntries(SpineTimelineType::kRotate);
-                const uint32_t cur =
-                    SpineGpuBinarySearchFrames(nocache.frames.data() + tl.frame_first, tl.frame_count, entries, 0.75f);
-                float got = -1.0f;
-                const SpineImportResult r = SpineGpuCurvePercentAt(nocache, tl, tli, cur, 0.75f, got);
-                Check(!r.ok, "缓存: 没建缓存 ⇒ 报错（不静默退回 O(段数) 的慢路径）");
-                std::printf("  (预期报错) %s\n", r.error.c_str());
-            }
+            SpineGpuRuntimeData ndata;
+            const SpineImportResult r = SpineGpuBuildRuntimeData(nocache, ndata);
+            Check(!r.ok, "缓存: 没建缓存 ⇒ 建查找表就报错（不静默退回 O(段数) 的慢路径）");
+            std::printf("  (预期报错) %s\n", r.error.c_str());
         }
 
         // 往返：容器里**只有** 4 个控制点（表是派生的、不落盘），读回来必须重建出一模一样的表

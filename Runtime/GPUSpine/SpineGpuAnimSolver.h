@@ -74,20 +74,54 @@ SpineImportResult SpineGpuBuildCurveCache(SpineGpuAsset& asset);
 // 实现 —— 两份实现只要有一处写反，表现只是"姿势偏一点"。
 uint32_t SpineGpuBinarySearchFrames(const float* frames, uint32_t count, uint32_t step, float target);
 
+// 一条时间轴的**预解析记录**（载入期算一次，apply 只读）。
+//
+// 2026-10-29 之前每次 apply 都要重算这一堆：类型 → 每帧 float 数（`SpineTimelineEntries`）、
+// `frame_first + frame_count × entries` 的越界检查、曲线段地址 `curve_first + 段号` 和它那
+// 一串边界检查（`SpineGpuCurvePercentAt` 里 5 次 `vector::size()` 读 + 2 次 64 位加）。
+// 输入只有容器，输出恒定 ⇒ 全部前移进 `SpineGpuRuntimeData`（PERF_ACCEPTANCE §1.5 的
+// 结论：与参考实现的差是"每条时间轴的 apply 贵 10 ns"，不是某一类写坏了 ⇒ 只能靠
+// 摊薄**所有类型**的共同固定开销）。
+//
+// ⚠️ `frames` / `curve` / `bezier` 是**指进 `SpineGpuAsset` 内部**的裸指针：
+//    `SpineGpuRuntimeData` 必须与它那个 asset 配对使用，且 asset 建完表之后**不能再写**
+//    （`frames` / `curve_types` / `curve_bezier_index` 重新分配 ⇒ 悬垂，且不报错）。
+//    这与 `SpineGpuAsset` 的既有约定一致：它是"烘焙 / 读完就只读"的容器镜像。
+//    ⚠️ 反过来，**移动** asset 是安全的：`vector` 搬家不动堆上的元素。
+struct SpineGpuTimelineRt
+{
+    const float* frames = nullptr;   // = &asset.frames[frame_first]
+    uint32_t frame_count = 0;
+    uint32_t entries = 0;            // 每帧几个 float（= SpineTimelineEntries(type)）
+    uint32_t target = 0;             // = SpineGpuTimeline::target
+    uint32_t type = 0;               // = SpineGpuTimeline::type（SpineTimelineType 的值）
+    // 本时间轴**段 0** 的曲线类型 / bezier 条号表起点；非 CurveTimeline（attachment /
+    // drawOrder / event）= nullptr。第 s 段 = curve[s] / bezier[s]，s = 帧号 - 1。
+    // 区间已按 `frame_count - 1` 段在载入期校验过 ⇒ 求值时不再查边界。
+    const uint8_t* curve = nullptr;
+    const uint32_t* bezier = nullptr;
+
+    float FirstTime() const { return frames[0]; }
+    float LastTime() const { return frames[static_cast<size_t>(frame_count - 1u) * entries]; }
+    // 末帧第 k 个值（k 从 1 起；= 参考实现的 `_frames[_frames.size() + PREV_*]`）
+    float Last(uint32_t k) const { return frames[static_cast<size_t>(frame_count - 1u) * entries + k]; }
+};
+
 // 求"第 `cur` 帧"那一段的插值进度（`cur` = `SpineGpuBinarySearchFrames` 的返回）。
 //
 // 一次做完三件事，因为它们必须成套：
 //   1. `percent = (time - prevTime) / (frameTime - prevTime)`
 //   2. 段号 = `cur / entries - 1`（`ColorTimeline.cpp:93` 的 `frame / ENTRIES - 1`）
-//   3. 过曲线（`SpineGpuCurvePercent`），bezier 的表按 `curve_bezier_index[curve_first + 段号]`
-//      取（O(1)，由 `SpineGpuBuildCurveCache()` 备好；没备好就**报错**）。
+//   3. 过曲线（`SpineGpuCurvePercent`），bezier 的表按 `rt.bezier[段号]`
+//      取（O(1)，由 `SpineGpuBuildCurveCache()` 备好；没备好在**载入期**就报错）。
 //
 // ⚠️ 参考实现写的是 `1 - (time - frameTime) / (prevTime - frameTime)`
 //    （两个负数相除再被 1 减）。数学上等价，**浮点上不等价**（多一次减法与一次除法）。
 //    这里用标准写法，与参考实现的差在 ulp 级，对拍按 ulp 容差比。
 //
+// `asset` 只用来取 `bezier_tables`（所有时间轴共用一张表，不逐条存指针）；
 // `tl_index` 只用来写错误信息。
-SpineImportResult SpineGpuCurvePercentAt(const SpineGpuAsset& asset, const SpineGpuTimeline& tl, uint32_t tl_index,
+SpineImportResult SpineGpuCurvePercentAt(const SpineGpuAsset& asset, const SpineGpuTimelineRt& rt, uint32_t tl_index,
                                          uint32_t cur, float time, float& percent_out);
 
 // 一个槽位在某一时刻的解算结果。

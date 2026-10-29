@@ -62,23 +62,21 @@ uint32_t SpineGpuBinarySearchFrames(const float* frames, uint32_t count, uint32_
     }
 }
 
-SpineImportResult SpineGpuCurvePercentAt(const SpineGpuAsset& asset, const SpineGpuTimeline& tl, uint32_t tl_index,
+SpineImportResult SpineGpuCurvePercentAt(const SpineGpuAsset& asset, const SpineGpuTimelineRt& rt, uint32_t tl_index,
                                          uint32_t cur, float time, float& percent_out)
 {
-    const uint32_t entries = SpineTimelineEntries(static_cast<SpineTimelineType>(tl.type));
+    const uint32_t entries = rt.entries;
     if (entries == 0 || cur < entries)
     {
         return Fail("sample: 第 " + std::to_string(tl_index) + " 条时间轴的帧定位结果不自洽");
     }
     // `cur` 是**相对本时间轴帧数组起点**的下标（BinarySearchFrames 的口径）。
-    const uint64_t abs_cur = static_cast<uint64_t>(tl.frame_first) + cur;
-    const uint64_t abs_prev = static_cast<uint64_t>(tl.frame_first) + (cur - entries);
-    if (abs_cur >= asset.frames.size() || abs_prev >= asset.frames.size())
-    {
-        return Fail("sample: 第 " + std::to_string(tl_index) + " 条时间轴的帧区间越界");
-    }
-    const float ft = asset.frames[static_cast<size_t>(abs_cur)];
-    const float pt = asset.frames[static_cast<size_t>(abs_prev)];
+    // ⚠️ 区间越界检查已前移到载入期（`SpineGpuBuildRuntimeData` 按 `frame_count` 校验
+    //    `frame_first .. frame_first + frame_count × entries`）；binary search 的返回值恒落在
+    //    [entries, (frame_count-1)×entries] ⇒ 这里再查一遍只是白付两次 `size()` 读。
+    //    曲线段 / bezier 表同理（逐段在载入期校验）。
+    const float ft = rt.frames[cur];
+    const float pt = rt.frames[cur - entries];
     // ⚠️ 逐字照抄参考实现的写法 `1 - (time - frameTime) / (prevTime - frameTime)`
     //    （RotateTimeline.cpp:101-102、TranslateTimeline.cpp:96-97、DeformTimeline.cpp:186 …
     //    所有 CurveTimeline 都是这一句）。`(time - pt) / (ft - pt)` 数学上相等，浮点结果差
@@ -88,36 +86,19 @@ SpineImportResult SpineGpuCurvePercentAt(const SpineGpuAsset& asset, const Spine
 
     // 段号 = 前一帧的下标（`ColorTimeline.cpp:93` `frame / ENTRIES - 1`）
     const uint32_t segment = cur / entries - 1u;
-    const size_t ci = static_cast<size_t>(tl.curve_first) + segment;
-    if (ci >= asset.curve_types.size())
-    {
-        return Fail("sample: 第 " + std::to_string(tl_index) + " 条时间轴的曲线段下标越界");
-    }
-    const SpineCurveType curve = static_cast<SpineCurveType>(asset.curve_types[ci]);
+    const SpineCurveType curve = static_cast<SpineCurveType>(rt.curve[segment]);
     const float* bez_table = nullptr;
     if (curve == SpineCurveType::kBezier)
     {
-        // ⚠️ `curve_bezier_index` 是**派生**数据（加载后由 `SpineGpuBuildCurveCache()` 建）。
-        //    没建就在这里报错，绝不退回"从段 0 扫一遍数 bezier"—— 那只慢不报错，
-        //    而"慢"正是这类 bug 唯一的表现。
-        if (asset.curve_bezier_index.size() != asset.curve_types.size())
-        {
-            return Fail("sample: 第 " + std::to_string(tl_index) +
-                        " 条时间轴要读 bezier，但曲线缓存没建（烘焙 / 读容器后必须调 "
-                        "SpineGpuBuildCurveCache）—— 不在这里悄悄退化成 O(段数) 的慢路径");
-        }
-        const uint32_t bi = asset.curve_bezier_index[ci];
+        // 段区间 / bezier 表区间都在载入期校验过了；只剩"这段标了 bezier 但缓存里没控制点"
+        // 这一条必须留在这里 —— 它是 `kSpineNoBezierIndex` 的语义，读下去就是越界。
+        const uint32_t bi = rt.bezier[segment];
         if (bi == kSpineNoBezierIndex)
         {
             return Fail("sample: 第 " + std::to_string(tl_index) + " 条时间轴第 " + std::to_string(segment) +
                         " 段标了 bezier 但缓存里没有控制点");
         }
-        if (static_cast<size_t>(bi) * kSpineBezierTableStride + kSpineBezierTableStride >
-            asset.bezier_tables.size())
-        {
-            return Fail("sample: 第 " + std::to_string(tl_index) + " 条时间轴的 bezier 表下标越界");
-        }
-        bez_table = &asset.bezier_tables[static_cast<size_t>(bi) * kSpineBezierTableStride];
+        bez_table = asset.bezier_tables.data() + static_cast<size_t>(bi) * kSpineBezierTableStride;
     }
     percent_out = SpineGpuCurvePercent(curve, bez_table, percent);
     return Ok();
