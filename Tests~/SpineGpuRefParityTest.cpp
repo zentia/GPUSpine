@@ -408,6 +408,9 @@ struct S5Stats
     float clip_e2e_worst_rigid = 0.0f;  // 被裁项与裁剪多边形都是 rigid（没有权重量化）的那部分
     float clip_e2e_worst_rigid_uv = 0.0f;
     size_t clip_e2e_rigid_items = 0;
+    size_t clip_e2e_topo_diff = 0;      // 拓扑不同的项（权重量化在近乎平行的裁剪边上翻了判定）
+    size_t clip_e2e_topo_diff_rigid = 0;   // 其中**全 rigid** 的（没有权重量化 ⇒ 出现就是 bug，不是底噪）
+    std::string clip_e2e_topo_first;    // 第一个拓扑不同的项（可复核，不是"神秘的一个数"）
     size_t mixing_frames = 0;       // 至少一条轨道处于 mixingFrom 中的帧（确认真的在测混合）
     size_t multi_track_frames = 0;  // 两条及以上轨道同时生效的帧
     // 覆盖面：确认各分支真的被走到（脚本是随机的，光看"全过"不知道测没测到）
@@ -1170,6 +1173,27 @@ std::string S5CompareClip(const SpineGpuAsset& asset, const SpineGpuSkeletonStat
                                                      std::fabs(frame.xy[static_cast<size_t>(d.vertex_first) * 2u + q] - rv[q]));
                         s5.clip_e2e_worst_uv = std::max(
                             s5.clip_e2e_worst_uv, std::fabs(frame.uv[static_cast<size_t>(d.vertex_first) * 2u + q] - ruv[q]));
+                    }
+                }
+                else
+                {
+                    // 顶点 / 三角形个数不同 ⇒ 权重量化让某条近乎与裁剪边平行的边翻到了另一边。
+                    // **不算分叉**（参考自己在这条边上也是数值临界），但要记下来：个数变了而没人管，
+                    // 正是这类"错了不报错"最典型的形态。
+                    ++s5.clip_e2e_topo_diff;
+                    const bool rigid_here =
+                        asset.draw_items[d.draw_item].vertex_format == SpineVertexFormat::kRigid &&
+                        asset.clip_polygons[d.clip_row].vertex_format == SpineVertexFormat::kRigid;
+                    // ⚠️ 全 rigid 的项**没有**权重量化，两边输入只差浮点噪声 ⇒ 它要是也翻了拓扑，
+                    //    那就不是"量化底噪"而是我们的蒙皮 / 多边形世界坐标写错了。
+                    s5.clip_e2e_topo_diff_rigid += rigid_here ? 1u : 0u;
+                    if (s5.clip_e2e_topo_first.empty())
+                    {
+                        char tb[256];
+                        std::snprintf(tb, sizeof(tb), "%s 槽位 %u：顶点 %u vs 参考 %zu，三角形 %u vs %zu",
+                                      rigid_here ? "全 rigid" : "weighted", si, d.vertex_count, rv.size() / 2u,
+                                      d.index_count, rt.size());
+                        s5.clip_e2e_topo_first = tb;
                     }
                 }
             }
@@ -3014,6 +3038,12 @@ int main(int argc, char** argv)
         std::printf("     其中全 rigid（无权重量化）%zu 项：世界坐标最大误差 %.3g，UV 最大误差 %.3g\n", s5.clip_e2e_rigid_items,
                     static_cast<double>(s5.clip_e2e_worst_rigid), static_cast<double>(s5.clip_e2e_worst_rigid_uv));
         std::printf("  └ 裁剪帧最多的资产: %s（%zu 帧）\n", s5.clip_best_asset.c_str(), s5.clip_best_frames);
+        if (s5.clip_e2e_topo_diff != 0)
+        {
+            std::printf("  └ 拓扑不同 %zu 项（其中全 rigid %zu 项 —— 全 rigid 没有权重量化，出现就是 bug）；"
+                        "第一个：%s\n",
+                        s5.clip_e2e_topo_diff, s5.clip_e2e_topo_diff_rigid, s5.clip_e2e_topo_first.c_str());
+        }
         std::printf("tint black 覆盖面     : 可画槽位暗色非 0 共 %zu 次（其中有负分量 %zu 次）\n", s5.dark_drawn,
                     s5.dark_negative);
         std::printf("  └ 暗色最多的资产: %s（%zu 次）\n", s5.dark_best_asset.c_str(), s5.dark_best);
@@ -3033,7 +3063,32 @@ int main(int argc, char** argv)
             std::printf("  - %s\n", d.c_str());
         }
     }
-    const bool pass = st.mismatches == 0 && s5.assets_bad == 0;
+    // ---- 裁剪端到端的上界 ----
+    // 以前这一格**只统计不判定**，文档里挂着一句"v17 之后应随之下移（未重测）"。现在钉成上界：
+    // u8 权重时代是 35.5 骨架单位 / UV 0.151 ⇒ 这条能抓住"权重量化精度退化"这种
+    // **不报错、只是画面偏一点**的回退。种子由资产路径哈希决定 ⇒ 同一批资产上可复现，
+    // 上界不会随机翻。
+    bool clip_e2e_ok = true;
+    if (run_s5)
+    {
+        constexpr float kMaxWorld = 1.0f;          // 实测 0.194
+        constexpr float kMaxUv = 5.0e-3f;          // 实测 5.46e-4
+        constexpr float kMaxWorldRigid = 5.0e-3f;  // 实测 3.66e-4（无权重量化 ⇒ 只剩浮点噪声）
+        constexpr float kMaxUvRigid = 1.0e-5f;     // 实测 3.58e-7
+        // 覆盖：语料里必须有资产真的在裁 —— 否则上面四条全是 0，恒真，等于没测
+        const bool covered = s5.clip_frames != 0 && s5.clip_e2e_items != 0;
+        clip_e2e_ok = covered && s5.clip_e2e_worst <= kMaxWorld && s5.clip_e2e_worst_uv <= kMaxUv &&
+                      s5.clip_e2e_worst_rigid <= kMaxWorldRigid && s5.clip_e2e_worst_rigid_uv <= kMaxUvRigid &&
+                      s5.clip_e2e_topo_diff_rigid == 0;   // 全 rigid 翻拓扑 = 蒙皮 / 多边形坐标写错了
+        std::printf("裁剪端到端上界       : %s（覆盖 %zu 帧 / %zu 项；世界 %.3g ≤ %.3g，UV %.3g ≤ %.3g；"
+                    "rigid %.3g ≤ %.3g / %.3g ≤ %.3g）\n",
+                    clip_e2e_ok ? "OK" : "FAIL", s5.clip_frames, s5.clip_e2e_items,
+                    static_cast<double>(s5.clip_e2e_worst), static_cast<double>(kMaxWorld),
+                    static_cast<double>(s5.clip_e2e_worst_uv), static_cast<double>(kMaxUv),
+                    static_cast<double>(s5.clip_e2e_worst_rigid), static_cast<double>(kMaxWorldRigid),
+                    static_cast<double>(s5.clip_e2e_worst_rigid_uv), static_cast<double>(kMaxUvRigid));
+    }
+    const bool pass = st.mismatches == 0 && s5.assets_bad == 0 && clip_e2e_ok;
     std::printf("\n=== verdict: %s ===\n", pass ? "PASS" : "FAIL");
 
     return pass ? 0 : 1;
