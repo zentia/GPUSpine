@@ -12,14 +12,15 @@
 //   cmake --build build --target SpineGpuImportTest --config Debug
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuAnimSolver.h"
-#include "Runtime/Function/Render/Spine/SpineGpuBatch.h"
+#include "SpineGpuAnimSolver.h"
+#include "SpineGpuBatch.h"
 #include "SpineGpuEventFixture.h"
 #include "SpineGpuSkinFixture.h"
-#include "Runtime/Function/Render/Spine/SpineGpuAnimationState.h"
-#include "Runtime/Function/Render/Spine/SpineGpuTintBlack.h"
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
+#include "SpineGpuAnimationState.h"
+#include "SpineGpuTintBlack.h"
+#include "SpineGpuFormat.h"
+#include "SpineGpuImporter.h"
+#include "SpineGpuJsonFixture.h"
 
 #include <cmath>
 #include <cstddef>
@@ -1345,6 +1346,7 @@ bool DumpContainers(const SpineAtlas& atlas, const std::string& dir)
 
 int main(int argc, char** argv)
 {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // 不缓冲：经 MSYS 管道重定向时，缓冲的输出在进程退出时会丢（实测；与 SpineGpuBenchmark 同一招）
     const bool dump_mode = (argc >= 3 && std::strcmp(argv[1], "--dump") == 0);
     if (!dump_mode)
     {
@@ -1368,6 +1370,9 @@ int main(int argc, char** argv)
     // 只有图集就够落盘 ⇒ 夹具容器在这里就能出，不必先跑完整个套件
     if (dump_mode)
     {
+        // ⚠️ `RunParityTest.cmake` 是用 `execute_process`（**管道**）抓这行里的 "dump: N"。
+        //    stdout 走管道时是全缓冲，这行只有几十字节填不满缓冲区 ⇒ 不设成不缓冲的话
+        //    调用方拿到空串（落盘其实成功了），跨语言对拍会**假红**。见 main() 开头那句 setvbuf。
         return DumpContainers(atlas, argv[2]) ? 0 : 1;
     }
 

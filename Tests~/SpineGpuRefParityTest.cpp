@@ -56,13 +56,14 @@
 #include <spine/SlotData.h>
 #include <spine/Skin.h>
 
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
-#include "Runtime/Function/Render/Spine/SpineGpuAnimationState.h"
-#include "Runtime/Function/Render/Spine/SpineGpuBatch.h"
+#include "SpineGpuImporter.h"
+#include "SpineGpuJsonFixture.h"
+#include "SpineGpuAnimationState.h"
+#include "SpineGpuBatch.h"
 #include "SpineGpuEventFixture.h"
 #include "SpineGpuSkinFixture.h"
-#include "Runtime/Function/Render/Spine/SpineGpuClipper.h"
-#include "Runtime/Function/Render/Spine/SpineGpuPoseSolver.h"
+#include "SpineGpuClipper.h"
+#include "SpineGpuPoseSolver.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1749,6 +1750,7 @@ bool RunSkinFixture(size_t scripts, size_t frames, size_t max_details, S5Stats& 
 
 int main(int argc, char** argv)
 {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // 不缓冲：经 MSYS 管道重定向时，缓冲的输出在进程退出时会丢（实测；与 SpineGpuBenchmark 同一招）
     std::string dir;
     size_t limit = 0;   // 0 = 不限
     size_t max_details = 1;
