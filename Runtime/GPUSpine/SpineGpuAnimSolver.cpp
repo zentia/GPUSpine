@@ -85,7 +85,22 @@ SpineImportResult SpineGpuCurvePercentAt(const SpineGpuAsset& asset, const Spine
     float percent = 1.0f - (time - ft) / (pt - ft);
 
     // 段号 = 前一帧的下标（`ColorTimeline.cpp:93` `frame / ENTRIES - 1`）
-    const uint32_t segment = cur / entries - 1u;
+    //
+    // ⚠️ `entries` 是**每条时间轴不同的运行时值** ⇒ 直接写 `cur / entries` 编译出来是真整数
+    //    除法（x86 `div`，20~26 周期），而它只可能取 1/2/3/5/8 五个数（`SpineTimelineEntries`）
+    //    ⇒ 按值分派，每个分支的除数是**字面量**，编译器换成移位 / 乘倒数。
+    //    `cur` 恒是 `entries` 的倍数（binary search 返回 `(low + 1) * step`）⇒ 2 / 8 两档
+    //    用移位就是**精确**除，不是近似；3 / 5 两档由编译器用乘倒数，结果与 `div` 逐位相同。
+    uint32_t segment;
+    switch (entries)
+    {
+        case 1u: segment = cur - 1u; break;
+        case 2u: segment = (cur >> 1) - 1u; break;
+        case 3u: segment = cur / 3u - 1u; break;
+        case 5u: segment = cur / 5u - 1u; break;
+        case 8u: segment = (cur >> 3) - 1u; break;
+        default: segment = cur / entries - 1u; break;   // 兜底：不会走到，留着不为常量除法的正确性下注
+    }
     const SpineCurveType curve = static_cast<SpineCurveType>(rt.curve[segment]);
     const float* bez_table = nullptr;
     if (curve == SpineCurveType::kBezier)
