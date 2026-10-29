@@ -31,12 +31,13 @@
 //    最新数字与结论记在 `doc/GPU_SPINE_INTERCHANGE_FORMAT.md` §17（改口径要同步改那一节）。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuAnimationState.h"
-#include "Runtime/Function/Render/Spine/SpineGpuBatch.h"
-#include "Runtime/Function/Render/Spine/SpineGpuClipper.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
-#include "Runtime/Function/Render/Spine/SpineGpuPoseSolver.h"
-#include "Runtime/Function/Render/Spine/SpineGpuSkeletonState.h"
+#include "SpineGpuAnimationState.h"
+#include "SpineGpuBatch.h"
+#include "SpineGpuClipper.h"
+#include "SpineGpuImporter.h"
+#include "SpineGpuJsonFixture.h"
+#include "SpineGpuPoseSolver.h"
+#include "SpineGpuSkeletonState.h"
 
 #include "SpineGpuRefRuntime.h"
 

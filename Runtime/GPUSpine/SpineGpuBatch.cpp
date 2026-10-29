@@ -1,7 +1,7 @@
 // GPU-Spine 多实例拼包 —— 见 SpineGpuBatch.h
-#include "Runtime/Function/Render/Spine/SpineGpuBatch.h"
+#include "SpineGpuBatch.h"
 
-#include "Runtime/Function/Render/Spine/SpineGpuTintBlack.h"
+#include "SpineGpuTintBlack.h"
 
 #include <algorithm>
 #include <cmath>

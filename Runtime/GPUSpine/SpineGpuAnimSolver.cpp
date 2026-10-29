@@ -1,4 +1,4 @@
-#include "Runtime/Function/Render/Spine/SpineGpuAnimSolver.h"
+#include "SpineGpuAnimSolver.h"
 
 #include <algorithm>
 #include <cstring>

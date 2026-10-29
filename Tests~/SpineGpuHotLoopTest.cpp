@@ -26,14 +26,15 @@
 //   cmake --build build --target SpineGpuHotLoopTest --config Release
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuAnimSolver.h"
-#include "Runtime/Function/Render/Spine/SpineGpuAnimationState.h"
-#include "Runtime/Function/Render/Spine/SpineGpuBatch.h"
-#include "Runtime/Function/Render/Spine/SpineGpuClipper.h"
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
-#include "Runtime/Function/Render/Spine/SpineGpuPoseSolver.h"
-#include "Runtime/Function/Render/Spine/SpineGpuSkeletonState.h"
+#include "SpineGpuAnimSolver.h"
+#include "SpineGpuAnimationState.h"
+#include "SpineGpuBatch.h"
+#include "SpineGpuClipper.h"
+#include "SpineGpuFormat.h"
+#include "SpineGpuImporter.h"
+#include "SpineGpuJsonFixture.h"
+#include "SpineGpuPoseSolver.h"
+#include "SpineGpuSkeletonState.h"
 
 #include <cmath>
 #include <cstdio>

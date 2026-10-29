@@ -29,7 +29,7 @@
 // 参考实现：G:/OSGame/unity-engine-source/Modules/Spine/spine-cpp（3.8）
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuAnimSolver.h"
+#include "SpineGpuAnimSolver.h"
 
 #include <cstdint>
 #include <string>

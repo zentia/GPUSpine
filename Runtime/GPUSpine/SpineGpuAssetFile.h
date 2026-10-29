@@ -9,12 +9,12 @@
 // 认的文件：
 //   .zspg                    已烘焙容器，直接读（图集页按页名相对容器目录找）
 //   <名>.skel.bytes / .skel  二进制骨架（Unity 的 spine-unity 命名是前者；OSGame 782 个全是）
-//   <名>.json                json 骨架 —— **只有同名图集存在时**才当骨架（工程里大量 json 不是骨架）
+//                            **不支持 json**。
 // 图集：同名 `<名>.atlas` 或 `<名>.atlas.txt`；图集页 png 相对图集所在目录。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
+#include "SpineGpuFormat.h"
+#include "SpineGpuImporter.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-// 骨架源文件？（`.skel.bytes` / `.skel` / 带同名图集的 `.json`；大小写不敏感）
+// 骨架源文件？（`.skel.bytes` / `.skel`；大小写不敏感）
 bool SpineGpuIsSkeletonSourcePath(const std::filesystem::path& path);
 bool SpineGpuIsContainerPath(const std::filesystem::path& path);   // .zspg
 

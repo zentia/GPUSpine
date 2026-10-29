@@ -30,7 +30,7 @@
 // 用法（与参考实现相同）：每帧 `Update(dt)` → `Apply(skeleton_state)` → `SpineGpuUpdateWorld()`。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuSkeletonState.h"
+#include "SpineGpuSkeletonState.h"
 
 #include <cstddef>
 #include <cstdint>

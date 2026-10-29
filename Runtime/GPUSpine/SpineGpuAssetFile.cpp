@@ -1,4 +1,4 @@
-#include "Runtime/Function/Render/Spine/SpineGpuAssetFile.h"
+#include "SpineGpuAssetFile.h"
 
 #include <algorithm>
 #include <cctype>
@@ -44,7 +44,7 @@ std::filesystem::path SpineGpuStripSkeletonSuffix(const std::filesystem::path& s
 {
     const std::string lower = LowerFileName(skeleton_path);
     const std::string name = SpineGpuPathToUtf8(skeleton_path.filename());
-    for (const char* suf : {".skel.bytes", ".skel", ".json"})
+    for (const char* suf : {".skel.bytes", ".skel"})
     {
         if (EndsWith(lower, suf))
         {
@@ -74,17 +74,7 @@ bool SpineGpuFindAtlas(const std::filesystem::path& skeleton_path, std::filesyst
 bool SpineGpuIsSkeletonSourcePath(const std::filesystem::path& path)
 {
     const std::string lower = LowerFileName(path);
-    if (EndsWith(lower, ".skel.bytes") || EndsWith(lower, ".skel"))
-    {
-        return true;
-    }
-    if (EndsWith(lower, ".json"))
-    {
-        // json 太常见（工程配置 / 材质 / 场景旁的描述文件）：只有同名图集在时才当骨架
-        std::filesystem::path atlas;
-        return SpineGpuFindAtlas(path, atlas);
-    }
-    return false;
+    return EndsWith(lower, ".skel.bytes") || EndsWith(lower, ".skel");
 }
 
 std::filesystem::path SpineGpuCookedPathFor(const std::filesystem::path& skeleton_path)
@@ -144,18 +134,14 @@ SpineImportResult SpineGpuCookSkeleton(const std::filesystem::path& skeleton_pat
     // ⚠️ 按**扩展名**选解析器，不看内容：.skel 没魔数也没长度字段，猜错就是越界读
     SpineSourceSkeleton src;
     const std::string lower = LowerFileName(skeleton_path);
-    if (EndsWith(lower, ".json"))
-    {
-        r = ParseSpineSkeletonJson(reinterpret_cast<const char*>(skel_bytes.data()), skel_bytes.size(), &atlas, src);
-    }
-    else if (EndsWith(lower, ".skel") || EndsWith(lower, ".skel.bytes"))
+    if (EndsWith(lower, ".skel") || EndsWith(lower, ".skel.bytes"))
     {
         r = ParseSpineSkeletonBinary(skel_bytes.data(), skel_bytes.size(), &atlas, src);
     }
     else
     {
         r.ok = false;
-        r.error = "认不出骨架类型（只认 .json / .skel / <名>.skel.bytes）：" + SpineGpuPathToUtf8(skeleton_path);
+        r.error = "认不出骨架类型（只认 .skel / <名>.skel.bytes）：" + SpineGpuPathToUtf8(skeleton_path);
         return r;
     }
     if (!r.ok)

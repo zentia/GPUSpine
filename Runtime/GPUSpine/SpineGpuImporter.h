@@ -18,7 +18,7 @@
 //   * 缺图集 region         → 报错，不拿零 UV 糊过去
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
+#include "SpineGpuFormat.h"
 
 #include <cstdint>
 #include <string>
@@ -525,11 +525,6 @@ struct SpineSourceSkeleton
 // 3.7.xx → 30700、3.8.xx → 30800，与 `SpineGpuConstants::kSpineRuntime37/38` 一致）。
 bool ClassifySpineVersion(const std::string& version_string, SpineSourceVersion& out_version,
                           uint32_t& out_runtime, std::string& out_error);
-
-// 解析 Spine 3.8 的 json 导出。atlas 可为 nullptr —— 但那样所有需要 UV 的附件
-// 都会**报错**（不是给零 UV 糊过去）。
-SpineImportResult ParseSpineSkeletonJson(const char* json, size_t len, const SpineAtlas* atlas,
-                                         SpineSourceSkeleton& out);
 
 // 解析 Spine 3.8 的**二进制** `.skel` 导出（Spine 编辑器的默认导出格式）。
 // 产出与 json 版**同一个** SpineSourceSkeleton —— 后面的 Bake 完全不知道数据来自哪种。

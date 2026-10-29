@@ -1,4 +1,4 @@
-#include "Runtime/Function/Render/Spine/SpineGpuAnimationState.h"
+#include "SpineGpuAnimationState.h"
 
 #include <algorithm>
 #include <cmath>

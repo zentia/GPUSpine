@@ -19,10 +19,10 @@
 // 着色器侧（真的按 bone_base / inst_index 寻址）由 SpineGpuDx12RasterTest 在 GPU 上验。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuClipper.h"
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
-#include "Runtime/Function/Render/Spine/SpineGpuPoseSolver.h"
+#include "SpineGpuClipper.h"
+#include "SpineGpuFormat.h"
+#include "SpineGpuImporter.h"
+#include "SpineGpuPoseSolver.h"
 
 #include <cstdint>
 #include <vector>

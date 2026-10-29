@@ -6,7 +6,7 @@
 //    一个翻译单元 include 它（两个 exe 都是单 .cpp，正好）。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
+#include "SpineGpuImporter.h"
 
 #include <spine/AtlasAttachmentLoader.h>
 #include <spine/AttachmentLoader.h>

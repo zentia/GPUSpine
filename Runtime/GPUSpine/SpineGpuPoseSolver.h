@@ -25,7 +25,7 @@
 // 参考实现：G:/OSGame/unity-engine-source/Modules/Spine/spine-cpp（3.8）
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuSkeletonState.h"
+#include "SpineGpuSkeletonState.h"
 
 // 一根骨骼在某一时刻的解算结果：**世界** 2x2 + 平移。
 // 这就是要上传给 GPU 的那个矩阵（`SpineBoneTransform`，§5.1）。

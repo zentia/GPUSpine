@@ -23,8 +23,8 @@
 //    不要凭印象改。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
+#include "SpineGpuFormat.h"
+#include "SpineGpuImporter.h"
 
 // 曲线求值：把"段内的线性进度" percent ∈ [0,1] 映射成"插值用的" percent。
 // `bezier` 只在 type == kBezier 时被读（其它类型传 nullptr 也安全）。

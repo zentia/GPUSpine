@@ -1,0 +1,12 @@
+build*/
+.vs/
+.vscode/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.sln
+*.vcxproj*
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/

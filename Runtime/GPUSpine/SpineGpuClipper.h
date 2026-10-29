@@ -29,10 +29,10 @@
 // 写 1、176 个写 0 —— 关掉的那部分画面本来就不裁，是宿主的选择，不是数据）。
 // =====================================================================
 
-#include "Runtime/Function/Render/Spine/SpineGpuFormat.h"
-#include "Runtime/Function/Render/Spine/SpineGpuImporter.h"
-#include "Runtime/Function/Render/Spine/SpineGpuPoseSolver.h"
-#include "Runtime/Function/Render/Spine/SpineGpuSkeletonState.h"
+#include "SpineGpuFormat.h"
+#include "SpineGpuImporter.h"
+#include "SpineGpuPoseSolver.h"
+#include "SpineGpuSkeletonState.h"
 
 #include <cstddef>
 #include <cstdint>
