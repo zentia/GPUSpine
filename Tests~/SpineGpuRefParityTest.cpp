@@ -110,6 +110,9 @@ float g_tolerance = 1.0e-4f;
 
 // S6 端到端蒙皮：rigid 的世界坐标绝对误差门槛（骨架单位）。
 constexpr float kRigidSkinTol = 1.0e-3f;
+// weighted 的门槛（v17 u16 权重）：量化步长 1/65535 × 骨骼到顶点的距离（OSGame 上千单位）
+// ≈ 0.02 骨架单位量级；给 0.1 的余量。u8 时代实测 5.2，会被这道门挡住。
+constexpr float kWeightedSkinTol = 0.1f;
 
 bool CloseEnough(float a, float b, float& worst_rel)
 {
@@ -322,7 +325,7 @@ struct Stats
     size_t gpu_addr_checks = 0;        // S6：weighted 影响流在附件内连续（GPU deform 寻址的前提）
     // S6 端到端：按 spine_gpu.vert **同一套寻址 / 公式**在 CPU 上蒙皮，与参考
     // `VertexAttachment::computeWorldVertices()` 比世界坐标。按 (rigid/weighted) × (有/无 deform) 分四格：
-    // weighted 的权重是 u8 量化的（容器格式的既定取舍），所以它的误差底噪由"无 deform"那格给出，
+    // weighted 的权重是 u16 量化的（v17；v16 及以前 u8 时底噪是 5.2 骨架单位），误差底噪由"无 deform"那格给出，
     // "有 deform"那格只要与底噪同量级就说明 deform 寻址 / 加法没错（错了是成百上千单位）。
     size_t skin_verts[2][2] = {{0, 0}, {0, 0}};
     float skin_worst[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
@@ -402,7 +405,7 @@ struct S5Stats
     size_t clip_e2e_same_topo = 0;      // 其中三角形 / 顶点数相同的
     float clip_e2e_worst = 0.0f;        // 拓扑相同的项里世界坐标最大绝对误差
     float clip_e2e_worst_uv = 0.0f;
-    float clip_e2e_worst_rigid = 0.0f;  // 被裁项与裁剪多边形都是 rigid（没有 u8 权重量化）的那部分
+    float clip_e2e_worst_rigid = 0.0f;  // 被裁项与裁剪多边形都是 rigid（没有权重量化）的那部分
     float clip_e2e_worst_rigid_uv = 0.0f;
     size_t clip_e2e_rigid_items = 0;
     size_t mixing_frames = 0;       // 至少一条轨道处于 mixingFrom 中的帧（确认真的在测混合）
@@ -1010,7 +1013,7 @@ std::string S5CheckBatch(const SpineGpuAsset& asset, const SpineGpuSkeletonState
 // ---------------------------------------------------------------------
 // v15：裁剪对拍。参考侧照 MeshGeneration/SpineMesh.h:107-259 的绘制循环跑 spine::SkeletonClipping；
 // 同一个循环里把**参考的**世界坐标 / UV / 三角形 / 裁剪多边形同时喂给我们的转录版
-// （SpineGpuSkeletonClipping），逐位比；再拿我们完整的一帧（SpineGpuClipFrame：状态机 + u8 权重
+// （SpineGpuSkeletonClipping），逐位比；再拿我们完整的一帧（SpineGpuClipFrame：状态机 + u16 权重
 // 的 CPU 蒙皮）比作用域（硬判据）与端到端几何（只统计）。
 // ---------------------------------------------------------------------
 std::string S5CompareClip(const SpineGpuAsset& asset, const SpineGpuSkeletonState& st, const SpineGpuPoseResult& pose,
@@ -2690,7 +2693,7 @@ int main(int argc, char** argv)
                                         }
                                         const SpineInfluenceBone& ib = loaded.influence_bone[off + k];
                                         const SpineGpuBoneSample& b = ours.bones[ib.bone_idx];
-                                        const float w = static_cast<float>(ib.weight) / 255.0f;
+                                        const float w = SpineGpuDecodeWeight(ib.weight);
                                         x += (bx * b.a + by * b.b + b.world_x) * w;
                                         y += (bx * b.c + by * b.d + b.world_y) * w;
                                     }
@@ -2707,8 +2710,7 @@ int main(int argc, char** argv)
                             if (worst > cell)
                             {
                                 cell = worst;
-                                // weighted 的误差被 u8 权重量化主导（见 skin_worst 注释），只有 rigid 超阈值才值得逐条列出
-                                if (!weighted && worst > kRigidSkinTol && st.details.size() < max_details)
+                                if (worst > (weighted ? kWeightedSkinTol : kRigidSkinTol) && st.details.size() < max_details)
                                 {
                                     st.details.push_back(skel_path.filename().string() + " 动画 " + std::to_string(ai) +
                                                          " t=" + std::to_string(t) + " 槽位 " + std::to_string(si) +
@@ -2945,7 +2947,7 @@ int main(int argc, char** argv)
     std::printf("蒙皮端到端（世界坐标最大绝对误差，单位 = 骨架单位）:\n");
     std::printf("    rigid    无 deform %zu 顶点 %.4g | 有 deform %zu 顶点 %.4g\n", st.skin_verts[0][0],
                 static_cast<double>(st.skin_worst[0][0]), st.skin_verts[0][1], static_cast<double>(st.skin_worst[0][1]));
-    std::printf("    weighted 无 deform %zu 顶点 %.4g | 有 deform %zu 顶点 %.4g（权重 u8 量化的底噪看左边）\n",
+    std::printf("    weighted 无 deform %zu 顶点 %.4g | 有 deform %zu 顶点 %.4g（权重 u16 量化）\n",
                 st.skin_verts[1][0], static_cast<double>(st.skin_worst[1][0]), st.skin_verts[1][1],
                 static_cast<double>(st.skin_worst[1][1]));
     // 门槛：rigid 两格都是"同一套 float 运算、只差求和顺序"⇒ 1e-3 骨架单位足够宽；
@@ -2953,6 +2955,12 @@ int main(int argc, char** argv)
     if (st.skin_worst[0][0] > kRigidSkinTol || st.skin_worst[0][1] > kRigidSkinTol)
     {
         std::printf("[对不上] rigid 蒙皮误差超过 %g\n", static_cast<double>(kRigidSkinTol));
+        ++st.mismatches;
+    }
+    // v17 起 weighted 也有绝对门槛（u8 时代是 5.2，只能跟自己的底噪比）。
+    if (st.skin_worst[1][0] > kWeightedSkinTol || st.skin_worst[1][1] > kWeightedSkinTol)
+    {
+        std::printf("[对不上] weighted 蒙皮误差超过 %g（u16 权重下不该有这么大）\n", static_cast<double>(kWeightedSkinTol));
         ++st.mismatches;
     }
     if (st.skin_verts[1][1] > 0 && st.skin_worst[1][1] > 1.5f * st.skin_worst[1][0] + kRigidSkinTol)
@@ -3000,7 +3008,7 @@ int main(int argc, char** argv)
                     s5.clip_scope_checks);
         std::printf("  └ 同输入 clipTriangles 逐位: %zu 次（输出 %zu 顶点，clipStart 凸块 %zu）\n", s5.clip_core_calls,
                     s5.clip_core_out_vertices, s5.clip_core_pieces);
-        std::printf("  └ 端到端（u8 权重蒙皮）: %zu 项，拓扑相同 %zu 项，世界坐标最大误差 %.3g，UV 最大误差 %.3g\n",
+        std::printf("  └ 端到端（u16 权重蒙皮）: %zu 项，拓扑相同 %zu 项，世界坐标最大误差 %.3g，UV 最大误差 %.3g\n",
                     s5.clip_e2e_items, s5.clip_e2e_same_topo, static_cast<double>(s5.clip_e2e_worst),
                     static_cast<double>(s5.clip_e2e_worst_uv));
         std::printf("     其中全 rigid（无权重量化）%zu 项：世界坐标最大误差 %.3g，UV 最大误差 %.3g\n", s5.clip_e2e_rigid_items,

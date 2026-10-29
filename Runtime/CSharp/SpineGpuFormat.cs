@@ -59,7 +59,10 @@ namespace ZEngine.SpineGpu
         // v16 = 用户事件进容器：chunk 23（事件定义 28 B/条 + 自带字符串池），event 时间轴（type 7）
         //       进时间轴表，载荷 24 B/帧（SpineGpuEventKey）。动画 duration 把末个事件的 time 算进去
         //       （与参考实现一致；v15 不烘焙事件 ⇒ 少算）。
-        public const uint FormatVersion = 16;
+        // v17 = 骨骼权重 unorm8 → unorm16（chunk 22 每条仍 4 B：u16 boneIdx @0 + u16 weight @2，
+        //       原 @3 的 pad 被吃掉）。每个权重顶点的权重和恰好 WeightUnorm（65535）。
+        public const uint FormatVersion = 17;
+        public const uint WeightUnorm = 65535;
         public const uint EventChunkHeaderSize = 16;
         public const uint EventDataSize = 28;
         public const uint EventKeySize = 24;
@@ -413,8 +416,7 @@ namespace ZEngine.SpineGpu
 
         // 影响流一条骨骼记录（chunk 22，4 B）
         public const int IbBoneIdx = 0;    // u16
-        public const int IbWeight = 2;     // u8，unorm8
-        public const int IbPad = 3;        // u8，落盘必须写 0
+        public const int IbWeight = 2;     // u16，unorm16（v17）
 
         // 骨骼 setup 一条（chunk 10，36 B）
         public const int BoneX = 0;
@@ -568,7 +570,8 @@ namespace ZEngine.SpineGpu
             CheckOffset(SpineGpuOffsets.AttSkinId, 2, SpineGpuConstants.AttachmentRecordSize, "attachment skin_id");
             CheckOffset(SpineGpuOffsets.WvInfluenceCount, 4, SpineGpuConstants.WeightedVertexStride,
                         "weighted influence_count");
-            CheckOffset(SpineGpuOffsets.IbWeight, 1, SpineGpuConstants.InfluenceBoneStride, "influence bone weight");
+            CheckOffset(SpineGpuOffsets.IbWeight, 2, SpineGpuConstants.InfluenceBoneStride, "influence bone weight (u16, v17)");
+            Check(SpineGpuConstants.WeightUnorm == 65535, "weight unorm16 full scale is 65535 (v17)");
             CheckOffset(SpineGpuOffsets.HdrSkinCount, 4, SpineGpuConstants.HeaderSize, "header skin_count");
             CheckOffset(SpineGpuOffsets.BoneParent, 2, SpineGpuConstants.BoneSetupSize, "bone parent");
             CheckOffset(SpineGpuOffsets.BoneTransformMode, 1, SpineGpuConstants.BoneSetupSize, "bone transform_mode");

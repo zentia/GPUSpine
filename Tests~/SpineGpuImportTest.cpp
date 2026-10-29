@@ -4,7 +4,7 @@
 // 夹具是一份手写的 3.8 json + atlas，故意覆盖：
 //   * 一个 region（rigid，4 顶点）
 //   * 一个 mesh，4 个顶点里第 2 个是 2 影响（1 影响 / 2 影响 / 1 影响 / 1 影响）
-//   * 权重 0.6 + 0.4（量化后应恰好 153 + 102 = 255）
+//   * 权重 0.6 + 0.4（v17 unorm16：量化后应恰好 39321 + 26214 = 65535）
 // 然后钉死"静默就会错"的规则：影响数超限、权重和、段对齐、版本。
 //
 // Build / run:
@@ -1573,7 +1573,7 @@ int main(int argc, char** argv)
     Check(asset.draw_items.size() == 2 && asset.draw_items[0].uv_offset == 0u, "绘制项 0 的 uv_offset = 0");
     Check(asset.draw_items.size() == 2 && asset.draw_items[1].uv_offset == 4u, "绘制项 1 的 uv_offset = 4");
 
-    // ---- 4. 影响流：每个顶点的 unorm8 权重和必须恰好 255 ----
+    // ---- 4. 影响流：每个顶点的 unorm16 权重和必须恰好 65535（v17；v16 及以前是 unorm8 / 255）----
     // v7 起蒙皮数据**不在顶点里**：顶点只有 (influence_offset, influence_count)，
     // 真正的 bindPos / 骨骼 / 权重在 influence_bind（float2）与 influence_bone 里。
     CheckEq(static_cast<long long>(asset.influence_bone.size()),
@@ -1600,21 +1600,21 @@ int main(int argc, char** argv)
             {
                 sum += asset.influence_bone[wv.influence_offset + k].weight;
             }
-            CheckEq(sum, 255, "权重和为 255");
+            CheckEq(sum, 65535, "权重和为 65535");
         }
         // ⚠️ 必须有一条**偏移非 0**的影响：全是 0 时"写错成恒 0"测不出来
         // （与裁剪多边形 vertex_offset 那条断言同一个道理）。
         Check(saw_nonzero_offset, "有权重顶点的 influence_offset 非 0（否则测不出偏移写错）");
     }
-    // 第 2 个顶点是 0.6 / 0.4 → 153 / 102，绑到 bone 1 与 bone 0
+    // 第 2 个顶点是 0.6 / 0.4 → 39321 / 26214（round(0.6·65535) / round(0.4·65535)），绑到 bone 1 与 bone 0
     {
         const uint8_t* wbase2 = asset.vertex_buffer.data() + asset.weighted_segment_offset;
         SpineWeightedVertex wv {};
         std::memcpy(&wv, wbase2 + SpineGpuConstants::kWeightedVertexStride, sizeof(wv));
         CheckEq(wv.influence_count, 2u, "第 2 个顶点有 2 个影响");
         CheckEq(wv.influence_offset, 1u, "第 2 个顶点的影响从第 1 条开始（前一个顶点占了 1 条）");
-        CheckEq(asset.influence_bone[wv.influence_offset + 0].weight, 153, "0.6 → 153");
-        CheckEq(asset.influence_bone[wv.influence_offset + 1].weight, 102, "0.4 → 102");
+        CheckEq(asset.influence_bone[wv.influence_offset + 0].weight, 39321, "0.6 → 39321");
+        CheckEq(asset.influence_bone[wv.influence_offset + 1].weight, 26214, "0.4 → 26214");
         CheckEq(asset.influence_bone[wv.influence_offset + 0].bone_idx, 1, "第 0 影响的骨骼下标");
         CheckEq(asset.influence_bone[wv.influence_offset + 1].bone_idx, 0, "第 1 影响的骨骼下标");
         // bindPos 也要对（v1 的两个影响分别是 (20,10) 与 (5,7)）
@@ -3005,6 +3005,22 @@ int main(int argc, char** argv)
 
     // ---- 8. 报错路径：版本不符必须拒绝，不做静默兼容 ----
     {
+        // v17：权重和不是 65535 ⇒ 读端拒绝（把 v16 的 u8 权重当 u16 读、或写端量化错，都会落到这里）
+        SpineGpuAsset skewed = back;
+        Check(!skewed.influence_bone.empty(), "weight-sum: 有影响流可改");
+        if (!skewed.influence_bone.empty())
+        {
+            skewed.influence_bone[0].weight = static_cast<uint16_t>(skewed.influence_bone[0].weight - 1u);
+            std::vector<uint8_t> skewed_bytes;
+            SpineGpuAsset dummy;
+            const bool wrote = WriteSpineGpuContainer(skewed, skewed_bytes).ok;
+            SpineImportResult r = wrote ? ReadSpineGpuContainer(skewed_bytes.data(), skewed_bytes.size(), dummy)
+                                        : SpineImportResult {};
+            Check(wrote && !r.ok, "权重和 65534 ⇒ 读回必须失败（v17）");
+            std::printf("  (预期报错) %s\n", r.error.c_str());
+        }
+    }
+    {
         std::vector<uint8_t> bad = bytes;
         uint32_t* ver = reinterpret_cast<uint32_t*>(bad.data() + 4);
         *ver = 999;
@@ -4178,7 +4194,7 @@ int main(int argc, char** argv)
                 }
                 Check((asset.header.flags & SpineGpuFlags::kHasDeform) == 0,
                       "deform→path: **不点亮** kHasDeform（没有绘制项可回退）");
-                CheckEq(asset.header.version, SpineGpuConstants::kFormatVersion, "deform→path: 容器版本是 v12");
+                CheckEq(asset.header.version, SpineGpuConstants::kFormatVersion, "deform→path: 容器版本是当前版本");
                 size_t n_deform = 0;
                 for (const SpineGpuTimeline& t : asset.timelines)
                 {
@@ -5081,9 +5097,9 @@ int main(int argc, char** argv)
                           ja.influence_bone[wv[1].influence_offset].bone_idx == 1,
                       "clip-weighted: 两个顶点分别绑到 bone 0 / bone 1");
                 Check(ja.influence_bone.size() >= 2 &&
-                          ja.influence_bone[wv[0].influence_offset].weight == 255 &&
-                          ja.influence_bone[wv[1].influence_offset].weight == 255,
-                      "clip-weighted: 权重 1.0 量化成 255");
+                          ja.influence_bone[wv[0].influence_offset].weight == 65535 &&
+                          ja.influence_bone[wv[1].influence_offset].weight == 65535,
+                      "clip-weighted: 权重 1.0 量化成 65535（v17 unorm16）");
             }
 
             // ---- .skel：二进制是**显式**标志，但结果必须一样 ----

@@ -135,7 +135,7 @@ namespace ZEngine.SpineGpu.Test
                 Check(b.InfluenceBone.Length == 5 * (int)SpineGpuConstants.InfluenceBoneStride,
                       "影响流 5 条（1+2+1+1）× 4 B = 20 B");
                 bool nonZeroOffset = false;
-                bool allWeights255 = true;
+                bool allWeightsFull = true;
                 for (uint v = 0; v < b.WeightedVertexCount; ++v)
                 {
                     int o = (int)(b.WeightedSegmentOffset + v * SpineGpuConstants.WeightedVertexStride);
@@ -145,12 +145,12 @@ namespace ZEngine.SpineGpu.Test
                     int sum = 0;
                     for (uint k = 0; k < cnt; ++k)
                     {
-                        sum += b.InfluenceBone[(off + k) * SpineGpuConstants.InfluenceBoneStride +
-                                               SpineGpuOffsets.IbWeight];
+                        sum += ReadU16(b.InfluenceBone, (int)((off + k) * SpineGpuConstants.InfluenceBoneStride) +
+                                                        SpineGpuOffsets.IbWeight);
                     }
-                    if (sum != 255) allWeights255 = false;
+                    if (sum != 65535) allWeightsFull = false;
                 }
-                Check(allWeights255, "每个权重顶点的 unorm8 权重和恰好 255");
+                Check(allWeightsFull, "每个权重顶点的 unorm16 权重和恰好 65535（v17）");
                 // ⚠️ 必须有一条**偏移非 0**的影响：全是 0 时"写错成恒 0"测不出来。
                 Check(nonZeroOffset, "有权重顶点的 influence_offset 非 0");
 
@@ -481,12 +481,12 @@ namespace ZEngine.SpineGpu.Test
                                                                       SpineGpuOffsets.IbBoneIdx));
                             ushort b1 = ReadU16(w.InfluenceBone, (int)(i1 * SpineGpuConstants.InfluenceBoneStride +
                                                                       SpineGpuOffsets.IbBoneIdx));
-                            byte w0 = w.InfluenceBone[i0 * SpineGpuConstants.InfluenceBoneStride +
-                                                      SpineGpuOffsets.IbWeight];
-                            byte w1 = w.InfluenceBone[i1 * SpineGpuConstants.InfluenceBoneStride +
-                                                      SpineGpuOffsets.IbWeight];
+                            ushort w0 = ReadU16(w.InfluenceBone, (int)(i0 * SpineGpuConstants.InfluenceBoneStride) +
+                                                                 SpineGpuOffsets.IbWeight);
+                            ushort w1 = ReadU16(w.InfluenceBone, (int)(i1 * SpineGpuConstants.InfluenceBoneStride) +
+                                                                 SpineGpuOffsets.IbWeight);
                             Check(b0 == 0 && b1 == 1, "两个顶点分别绑到 bone 0 / bone 1");
-                            Check(w0 == 255 && w1 == 255, "权重 1.0 量化成 255");
+                            Check(w0 == 65535 && w1 == 65535, "权重 1.0 量化成 65535（v17 unorm16）");
                         }
                     }
                 }
@@ -523,9 +523,10 @@ namespace ZEngine.SpineGpu.Test
 
             // 版本改一改 ⇒ 必须明确拒绝，不做静默兼容（规格 §11）
             _prefix = "[负向] ";
-            // ⚠️ 这里的"未来版本"必须跟着 kFormatVersion 走：v16 是当前版本，
-            //    所以"未来"是 17，而 15 已经变成"旧容器"了（事件不进容器、duration 不算事件）。
-            Rejects(Mutate(good, SpineGpuOffsets.HdrVersion, 17), "版本改成 17（未来容器）⇒ 拒绝");
+            // ⚠️ 这里的"未来版本"必须跟着 kFormatVersion 走：v17 是当前版本，
+            //    所以"未来"是 18，而 16 已经变成"旧容器"了（u8 权重）。
+            Rejects(Mutate(good, SpineGpuOffsets.HdrVersion, 18), "版本改成 18（未来容器）⇒ 拒绝");
+            Rejects(Mutate(good, SpineGpuOffsets.HdrVersion, 16), "版本改成 16（v16 旧容器：u8 权重）⇒ 拒绝");
             Rejects(Mutate(good, SpineGpuOffsets.HdrVersion, 15), "版本改成 15（v15 旧容器：用户事件不进容器）⇒ 拒绝");
             Rejects(Mutate(good, SpineGpuOffsets.HdrVersion, 14), "版本改成 14（v14 旧容器：裁剪多边形 12 B、裁剪 deform 被丢掉）⇒ 拒绝");
             Rejects(Mutate(good, SpineGpuOffsets.HdrVersion, 13), "版本改成 13（v13 旧容器：绘制项 28 B）⇒ 拒绝");

@@ -149,7 +149,17 @@ namespace SpineGpuConstants
     //     v15 读端读 v16 会把 kEvent 时间轴当"不改状态"跳过（这一半没问题），但 duration 已经变了
     //     ⇒ 照规矩升版本。字符串池自带在 chunk 23 里（不再往 chunk 1 塞第 10 组：chunk 1 的
     //     "最后一组靠剩余切分"已经被用掉了，再往前插一组就得再改一次切分规则）。
-    constexpr uint32_t kFormatVersion = 16;
+    // * v17 = **骨骼权重 unorm8 → unorm16**（chunk 22 每条仍是 4 B：u16 boneIdx @0 + u16 weight @2，
+    //     原来 @3 的 pad 被吃掉，**体积不变**）。一个顶点的权重和恰好 65535（原来是 255）。
+    //     原因：端到端蒙皮对拍（照 shader 公式 vs 参考 computeWorldVertices）里 weighted 顶点
+    //     最大误差 **5.2 骨架单位**，与 deform 无关，全来自 u8 量化（步长 1/255，乘上骨骼到顶点
+    //     的距离 ~1000 单位）。u16 把步长缩到 1/65535。
+    //     布局字节数没变、语义变（v16 读端会把高字节当 pad、低字节当 u8 权重 ⇒ 权重全错、不报错）
+    //     ⇒ 照规矩升版本，读端硬拒。
+    constexpr uint32_t kFormatVersion = 17;
+
+    // 骨骼权重的满量程（unorm16）。一个 weighted 顶点各影响的权重和**恰好**等于它。
+    constexpr uint32_t kWeightUnorm = 65535;
 
     // **id 0 恒为 default 皮肤**。
     // 两个来源都保证这一点：二进制格式的 default skin 就是先读的那一个
@@ -229,7 +239,7 @@ namespace SpineGpuConstants
     // `ByteAddressBuffer::Load2` 要 8 字节对齐，12 B 步长会让第 1、3、5…条落在
     // 12、36…（不是 8 的倍数）⇒ 只能退化成标量 Load。分开后 bindPos 流恒定 8 B 对齐。
     constexpr uint32_t kInfluenceBindStride = 8;    // float2 bindPos
-    constexpr uint32_t kInfluenceBoneStride = 4;    // u16 boneIdx + u8 weight + u8 pad
+    constexpr uint32_t kInfluenceBoneStride = 4;    // u16 boneIdx + u16 weight（v17：unorm16）
 
     // 一条影响 = bindPos(8) + bone(4)。**只用在导入期的去重池上**（当"键"用），
     // 落盘时拆成 chunk 21 / 22 两条流 —— 12 B 步长会破坏 Load2 的 8 B 对齐。
@@ -1261,7 +1271,7 @@ static_assert(offsetof(SpineRigidVertex, bind_pos) == 0, "spec 3.1: bindPos @0")
 static_assert(SpineGpuConstants::kRigidVertexStride % 8 == 0,
               "rigid stride must keep bindPos 8-byte aligned");
 
-// weighted：每个影响**一份** bindPos（不是每顶点一份）+ uint16 骨骼索引 + unorm8 权重。
+// weighted：每个影响**一份** bindPos（不是每顶点一份）+ uint16 骨骼索引 + unorm16 权重（v17）。
 // weighted 顶点（v7 起）：**只是一条指向影响流的引用**，真正的蒙皮数据在
 // chunk 21（bindPos）与 chunk 22（boneIdx+weight）里。
 //
@@ -1271,7 +1281,7 @@ static_assert(SpineGpuConstants::kRigidVertexStride % 8 == 0,
 // 蒙皮循环（shader）就变成：
 //   for (i = 0; i < influence_count; ++i) {
 //       float2 bp = bind.Load2((influence_offset + i) * 8);
-//       uint   bw = bone.Load ((influence_offset + i) * 4);   // boneIdx u16 | weight u8 << 16
+//       uint   bw = bone.Load ((influence_offset + i) * 4);   // boneIdx u16 | weight u16 << 16
 //       ...
 //   }
 // 均值 2.20 次迭代，而不是定长的 4 次（OSGame 实测）。
@@ -1290,28 +1300,36 @@ static_assert(SpineGpuConstants::kWeightedVertexStride % 8 == 0,
               "weighted stride must be 8-byte aligned (spec 3.1)");
 
 // 影响流里的一条骨骼+权重（chunk 22，4 B）。
-// ⚠️ 用 u32 一次 Load 出来再拆，而不是 Load u16 + Load u8：后者第二次 Load 的地址
-//    不是 4 字节对齐的（boneIdx 在 @0、weight 在 @2）⇒ 越界/未定义。
+// ⚠️ 用 u32 一次 Load 出来再拆（`bw & 0xFFFF` / `bw >> 16`），而不是两次 Load u16：
+//    后者第二次 Load 的地址不是 4 字节对齐的（weight 在 @2）⇒ ByteAddressBuffer 上越界/未定义。
+// v17：weight 从 unorm8（+ u8 pad）改成 unorm16，同一个 4 B 里放下，体积不变。
 struct SpineInfluenceBone
 {
     uint16_t bone_idx;   // @0
-    uint8_t weight;      // @2，unorm8
-    uint8_t pad;         // @3
+    uint16_t weight;     // @2，unorm16（v17；一个顶点的和恰好 kWeightUnorm）
 };
+
+// 唯一的解码式：所有 CPU 侧解码（裁剪、包围盒、对拍）都走它，shader 那边是
+// spine_skinning.h 里同一个式子。**除数必须是 65535.0f 的同一个 float 常量**，
+// 写成 `w * (1.0f / 65535.0f)` 会差 1 ulp（倒数先舍入），逐位对拍就对不上。
+inline float SpineGpuDecodeWeight(uint16_t w)
+{
+    return static_cast<float>(w) / 65535.0f;
+}
 
 static_assert(sizeof(SpineInfluenceBone) == SpineGpuConstants::kInfluenceBoneStride,
               "spec 3.1: influence bone record is 4 B");
 static_assert(offsetof(SpineInfluenceBone, bone_idx) == 0, "spec 3.1: boneIdx @0");
 static_assert(offsetof(SpineInfluenceBone, weight) == 2, "spec 3.1: weight @2");
+static_assert(std::is_same_v<decltype(SpineInfluenceBone::weight), uint16_t>, "v17: weight is unorm16");
+static_assert(SpineGpuConstants::kWeightUnorm == 0xFFFFu, "v17: unorm16 full scale");
 // 把「3.8 ⇒ 骨骼索引是 uint16」钉成编译期断言。
 static_assert(std::is_same_v<decltype(SpineInfluenceBone::bone_idx), uint16_t>,
               "Spine 3.8: _bones is Vector<unsigned short> -> bone index must be uint16 (spec 1.1)");
 
-// pad 也参与比较：它落盘必须是 0（跟裁剪多边形同一个规矩），
-// 放进去才能抓到"写端没清零"这种不报错的脏字节。
 inline bool operator==(const SpineInfluenceBone& a, const SpineInfluenceBone& b)
 {
-    return a.bone_idx == b.bone_idx && a.weight == b.weight && a.pad == b.pad;
+    return a.bone_idx == b.bone_idx && a.weight == b.weight;
 }
 inline bool operator!=(const SpineInfluenceBone& a, const SpineInfluenceBone& b) { return !(a == b); }
 

@@ -3127,9 +3127,11 @@ SpineImportResult ParseSpineSkeletonBinary(const uint8_t* data, size_t len, cons
 namespace
 {
 
-// 权重 → unorm8，且**和必须恰好 255**（规格 §3.1）。
+// 权重 → unorm16（v17；v16 及以前是 unorm8），且**和必须恰好 65535**（规格 §3.1）。
 // 余量补给权重最大的那个；补不进去就报错，绝不静默。
-bool QuantizeWeights(const float* w, int n, uint8_t* out8, std::string& err)
+// 为什么要"和恰好满量程"：shader 里 Σ wᵢ·(Bᵢ·vᵢ) 的 Σwᵢ 不等于 1 时，所有顶点会朝原点
+// 缩一点（或往外胀一点），而这在任何单个顶点上都看不出来。
+bool QuantizeWeights(const float* w, int n, uint16_t* out16, std::string& err)
 {
     float sum = 0.0f;
     for (int i = 0; i < n; ++i)
@@ -3142,28 +3144,30 @@ bool QuantizeWeights(const float* w, int n, uint8_t* out8, std::string& err)
         return false;
     }
 
+    constexpr int kFull = static_cast<int>(SpineGpuConstants::kWeightUnorm);
     int acc = 0;
     int max_i = 0;
     for (int i = 0; i < n; ++i)
     {
-        int q = static_cast<int>(std::lround(w[i] / sum * 255.0f));
-        q = std::max(0, std::min(255, q));
-        out8[i] = static_cast<uint8_t>(q);
+        // double：w/sum*65535 在 float 里只剩 ~8 位小数，四舍五入会被舍入误差带偏
+        int q = static_cast<int>(std::lround(static_cast<double>(w[i]) / static_cast<double>(sum) * kFull));
+        q = std::max(0, std::min(kFull, q));
+        out16[i] = static_cast<uint16_t>(q);
         acc += q;
-        if (q > out8[max_i])
+        if (q > out16[max_i])
         {
             max_i = i;
         }
     }
 
-    const int diff = 255 - acc;
-    const int fixed = static_cast<int>(out8[max_i]) + diff;
-    if (fixed < 0 || fixed > 255)
+    const int diff = kFull - acc;
+    const int fixed = static_cast<int>(out16[max_i]) + diff;
+    if (fixed < 0 || fixed > kFull)
     {
-        err = "量化后权重和为 " + std::to_string(acc) + "，无法调整到 255";
+        err = "量化后权重和为 " + std::to_string(acc) + "，无法调整到 " + std::to_string(kFull);
         return false;
     }
-    out8[max_i] = static_cast<uint8_t>(fixed);
+    out16[max_i] = static_cast<uint16_t>(fixed);
     return true;
 }
 
@@ -3282,7 +3286,7 @@ bool EncodeVertices(const std::string& what, const std::vector<float>& vertices,
 
             // 变长：按实际影响数开，不是 kMaxInfluences（那只是"数据坏了"的护栏）。
             std::vector<float> w(static_cast<size_t>(n), 0.0f);
-            std::vector<uint8_t> w8(static_cast<size_t>(n), 0u);
+            std::vector<uint16_t> w16(static_cast<size_t>(n), 0u);
             std::vector<uint16_t> idx(static_cast<size_t>(n), 0u);
             std::vector<float> bind(static_cast<size_t>(n) * 2u, 0.0f);
 
@@ -3309,7 +3313,7 @@ bool EncodeVertices(const std::string& what, const std::vector<float>& vertices,
                 bind[static_cast<size_t>(k) * 2u + 1u] = vy;
             }
 
-            if (!QuantizeWeights(w.data(), n, w8.data(), err))
+            if (!QuantizeWeights(w.data(), n, w16.data(), err))
             {
                 err = what + " 第 " + std::to_string(v) + " 个顶点：" + err;
                 return false;
@@ -3326,8 +3330,7 @@ bool EncodeVertices(const std::string& what, const std::vector<float>& vertices,
                     std::memcpy(influence_out->data() + at, &bind[static_cast<size_t>(k) * 2u], 2u * sizeof(float));
                     SpineInfluenceBone ib {};
                     ib.bone_idx = idx[static_cast<size_t>(k)];
-                    ib.weight = w8[static_cast<size_t>(k)];
-                    ib.pad = 0;
+                    ib.weight = w16[static_cast<size_t>(k)];
                     std::memcpy(influence_out->data() + at + SpineGpuConstants::kInfluenceBindStride, &ib,
                                 sizeof(ib));
                 }
@@ -6616,6 +6619,18 @@ SpineImportResult ReadSpineGpuContainer(const uint8_t* data, size_t len, SpineGp
                 return Fail("container: 第 " + std::to_string(v) + " 个权重顶点有 " +
                             std::to_string(wv.influence_count) + " 个影响，超过硬上限 " +
                             std::to_string(SpineGpuConstants::kMaxInfluences));
+            }
+            // v17：权重和必须恰好满量程。不等时 shader 里所有影响加起来不是 1，顶点整体朝原点
+            // 缩 / 胀，单看一个顶点看不出来；把 v16 的 u8 权重当 u16 读也会在这里被抓到。
+            uint32_t wsum = 0;
+            for (uint32_t k = 0; k < wv.influence_count; ++k)
+            {
+                wsum += out.influence_bone[static_cast<size_t>(wv.influence_offset) + k].weight;
+            }
+            if (wsum != SpineGpuConstants::kWeightUnorm)
+            {
+                return Fail("container: 第 " + std::to_string(v) + " 个权重顶点的权重和是 " + std::to_string(wsum) +
+                            "，必须恰好 " + std::to_string(SpineGpuConstants::kWeightUnorm) + "（unorm16，v17）");
             }
         }
     }

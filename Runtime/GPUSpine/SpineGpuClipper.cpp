@@ -48,7 +48,7 @@ namespace
 
     // `VertexAttachment::computeWorldVertices(slot, 0, n, out, 0, 2)` 在我们的顶点格式上的等价物：
     //   rigid    —— `vertex_offset` 起 `count` 个顶点（8 B：bindPos），槽位骨骼单矩阵；deform 非空 ⇒ 整体替换
-    //   weighted —— 每顶点 (influence_offset, influence_count)，权重是 **u8 / 255**（容器的量化，
+    //   weighted —— 每顶点 (influence_offset, influence_count)，权重是 **u16 / 65535**（v17，容器的量化，
     //               与 spine_gpu.vert 同一个公式 —— 不是参考实现的 float 权重）；deform 按影响顺序逐个加
     // 错误信息的前缀。**不在调用点拼字符串**：那等于每帧每个被裁剪的槽位一次堆分配
     // （`"clip: 绘制项 " + std::to_string(...)` 超过 SSO 容量，必走堆）。改成只带前缀 + 编号，
@@ -144,7 +144,7 @@ namespace
                     vx = vx + deform[f];
                     vy = vy + deform[f + 1u];
                 }
-                const float weight = static_cast<float>(ib.weight) / 255.0f;
+                const float weight = SpineGpuDecodeWeight(ib.weight);
                 wx += (vx * bone.a + vy * bone.b + bone.world_x) * weight;
                 wy += (vx * bone.c + vy * bone.d + bone.world_y) * weight;
             }

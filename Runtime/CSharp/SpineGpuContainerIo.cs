@@ -141,6 +141,38 @@ namespace ZEngine.SpineGpu
                     "）—— 它们必须共用同一个下标");
             }
 
+            // v17：每个权重顶点的影响区间落在流里、权重和恰好 65535（与 C++ 读端同一组检查）
+            if (asset.WeightedVertexCount > 0)
+            {
+                ulong segEnd = (ulong)asset.WeightedSegmentOffset +
+                               (ulong)asset.WeightedVertexCount * SpineGpuConstants.WeightedVertexStride;
+                if (asset.VertexBuffer == null || segEnd > (ulong)asset.VertexBuffer.Length)
+                {
+                    throw new SpineGpuContainerException("container: weighted 段越界");
+                }
+                for (uint v = 0; v < asset.WeightedVertexCount; ++v)
+                {
+                    int o = (int)(asset.WeightedSegmentOffset + v * SpineGpuConstants.WeightedVertexStride);
+                    uint off = ReadU32(asset.VertexBuffer, o + SpineGpuOffsets.WvInfluenceOffset);
+                    uint cnt = ReadU32(asset.VertexBuffer, o + SpineGpuOffsets.WvInfluenceCount);
+                    if (cnt == 0 || (ulong)off + cnt > boneCount)
+                    {
+                        throw new SpineGpuContainerException("container: 第 " + v + " 个权重顶点的影响区间不合法");
+                    }
+                    uint sum = 0;
+                    for (uint k = 0; k < cnt; ++k)
+                    {
+                        sum += ReadU16(asset.InfluenceBone,
+                                       (int)((off + k) * SpineGpuConstants.InfluenceBoneStride) + SpineGpuOffsets.IbWeight);
+                    }
+                    if (sum != SpineGpuConstants.WeightUnorm)
+                    {
+                        throw new SpineGpuContainerException("container: 第 " + v + " 个权重顶点的权重和是 " + sum +
+                                                             "，必须恰好 65535（unorm16，v17）");
+                    }
+                }
+            }
+
             // ---- UV ----
             if (TryGet(byId, (uint)SpineGpuChunkId.UvBuffer, out uint uo, out uint us))
             {

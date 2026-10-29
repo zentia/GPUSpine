@@ -386,7 +386,7 @@ bool SpineGpuEmulateVertex(const SpineGpuAsset& a, const SpineGpuBatch& batch, u
                 {
                     return false;
                 }
-                const float wt = static_cast<float>((bw >> 16u) & 0xFFu) / 255.0f;
+                const float wt = SpineGpuDecodeWeight(static_cast<uint16_t>(bw >> 16u));   // v17 unorm16
                 const float tx = bx * m[0] + by * m[1] + m[4];
                 const float ty = bx * m[2] + by * m[3] + m[5];
                 x += tx * wt;
