@@ -205,8 +205,13 @@ struct SpineGpuSlotState
 };
 
 // 对应参考实现的 `spine::Skeleton`（只含会被时间轴 / 约束改写的部分）。
-// IK / transform 约束的运行时参数没有放进来：它们只能被 IK / transform 时间轴改，
-// 而这两类时间轴本阶段**显式报错**（实测 0 / 782 个资产用到）⇒ 恒等于 setup。
+//
+// 三类约束的运行时参数都在这里：IK（`IkConstraint::_mix / _bendDirection / _compress / _stretch`）、
+// transform（`TransformConstraint::_rotateMix / _translateMix / _scaleMix / _shearMix`）、
+// path（`PathConstraint::_position / _spacing / _rotateMix / _translateMix`）。
+// 它们**不是** setup 常量 —— 约束时间轴每帧都可能改，而约束解算读的就是这些值
+// （`SpineGpuUpdateWorld`）。只存 path 那一份是不够的：IK / transform 时间轴是
+// "多轨高级混合"里最常见的一类参数轨（淡出时 mix 从 1 渐变到 0）。
 struct SpineGpuSkeletonState
 {
     uint32_t skin = kSpineGpuNoSkin;             // `Skeleton::_skin`
@@ -218,6 +223,18 @@ struct SpineGpuSkeletonState
     std::vector<float> path_spacing;
     std::vector<float> path_rotate_mix;
     std::vector<float> path_translate_mix;
+    // IK 约束的运行时参数（初值 = setup，`Skeleton::setBonesToSetupPose()` Skeleton.cpp:228-236）
+    std::vector<float> ik_mix;
+    // ⚠️ `bendDirection` 是 **int**（1 / -1），不是 float：时间轴里存的是 `(float)bendDirection`，
+    //    取出来要 `(int)` 截断回整数（`IkConstraintTimeline.cpp:101`）。
+    std::vector<int32_t> ik_bend_dir;
+    std::vector<uint8_t> ik_compress;
+    std::vector<uint8_t> ik_stretch;
+    // transform 约束的运行时参数（Skeleton.cpp:238-246）
+    std::vector<float> tf_rotate_mix;
+    std::vector<float> tf_translate_mix;
+    std::vector<float> tf_scale_mix;
+    std::vector<float> tf_shear_mix;
 };
 
 // 建查找表。出错 = 容器不自洽（读端应该已经报过，这里再挡一次：越界读不报错）。
@@ -258,7 +275,7 @@ SpineImportResult SpineGpuSetSkin(const SpineGpuAsset& asset, const SpineGpuRunt
 bool SpineGpuFindSkin(const SpineGpuAsset& asset, const std::string& name, uint32_t& out);
 
 // `Timeline::apply(skeleton, lastTime, time, events, alpha, blend, direction)`。
-// event 时间轴不改状态（这里不收集事件）；IK / transform / pathSpacing 时间轴**显式报错**。
+// event 时间轴不改状态（这里不收集事件）。
 SpineImportResult SpineGpuApplyTimeline(const SpineGpuAsset& asset, const SpineGpuRuntimeData& data,
                                         SpineGpuSkeletonState& state, uint32_t tl_index, float last_time, float time,
                                         float alpha, SpineGpuMixBlend blend, SpineGpuMixDirection direction);

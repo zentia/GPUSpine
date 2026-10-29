@@ -82,10 +82,6 @@ using BoneState = SpineGpuBoneState;
 // thread_local：渲染线程与工具线程各一份；SpineGpuUpdateWorld 不重入，同一线程上同一时刻只有一个使用者。
 struct PoseScratch
 {
-    std::vector<float> path_position;
-    std::vector<float> path_spacing;
-    std::vector<float> path_rotate_mix;
-    std::vector<float> path_translate_mix;
     std::vector<uint32_t> path_att;
     std::vector<std::vector<float>> path_deform;
     std::vector<float> positions;
@@ -105,6 +101,17 @@ struct PoseContext
     std::vector<float>& path_spacing;
     std::vector<float>& path_rotate_mix;
     std::vector<float>& path_translate_mix;
+    // IK / transform 约束的运行时参数（同上：时间轴每帧都可能改，解算必须读**改后**的值）。
+    // 之前这里读的是 `asset.iks[].mix` / `asset.transforms[].*_mix`（= setup 常量）⇒
+    // IK / transform 时间轴写了也不生效（静默错的姿势）。
+    std::vector<float>& ik_mix;
+    std::vector<int32_t>& ik_bend_dir;
+    std::vector<uint8_t>& ik_compress;
+    std::vector<uint8_t>& ik_stretch;
+    std::vector<float>& tf_rotate_mix;
+    std::vector<float>& tf_translate_mix;
+    std::vector<float>& tf_scale_mix;
+    std::vector<float>& tf_shear_mix;
     // 每条 path 约束**当前**看到的那条 chunk 20 记录；`kNoPathAttachment` = 不生效。
     std::vector<uint32_t>& path_att;
     // 每条 chunk 20 记录的 deform 数组（= 参考实现里该槽位的 `_attachmentVertices`）。
@@ -120,11 +127,13 @@ struct PoseContext
     std::vector<float>& spaces;
     float segments[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
-    PoseContext(const SpineGpuAsset& a, std::vector<BoneState>& b, PoseScratch& s)
-        : asset(a), bones(b), path_position(s.path_position), path_spacing(s.path_spacing),
-          path_rotate_mix(s.path_rotate_mix), path_translate_mix(s.path_translate_mix), path_att(s.path_att),
-          path_deform(s.path_deform), positions(s.positions), world(s.world), curves(s.curves), lengths(s.lengths),
-          spaces(s.spaces)
+    PoseContext(const SpineGpuAsset& a, std::vector<BoneState>& b, SpineGpuSkeletonState& st, PoseScratch& s)
+        : asset(a), bones(b), path_position(st.path_position), path_spacing(st.path_spacing),
+          path_rotate_mix(st.path_rotate_mix), path_translate_mix(st.path_translate_mix), path_att(s.path_att),
+          path_deform(s.path_deform), ik_mix(st.ik_mix), ik_bend_dir(st.ik_bend_dir), ik_compress(st.ik_compress),
+          ik_stretch(st.ik_stretch), tf_rotate_mix(st.tf_rotate_mix), tf_translate_mix(st.tf_translate_mix),
+          tf_scale_mix(st.tf_scale_mix), tf_shear_mix(st.tf_shear_mix), positions(s.positions), world(s.world),
+          curves(s.curves), lengths(s.lengths), spaces(s.spaces)
     {
     }
 };
@@ -394,9 +403,15 @@ inline void EnsureApplied(PoseContext& ctx, uint32_t i)
 }
 
 // TransformConstraint.cpp:138-216
-void TransformApplyAbsoluteWorld(PoseContext& ctx, const SpineGpuTransformConstraint& c, uint32_t ci)
+void TransformApplyAbsoluteWorld(PoseContext& ctx, uint32_t ci)
 {
-    (void)ci;
+    const SpineGpuTransformConstraint& c = ctx.asset.transforms[ci];
+    // ⚠️ 四个 mix 读的是**运行时**值（transform 约束时间轴每帧都可能改），
+    //    不是 `c.*_mix`（那是 setup 常量）。偏移 / target / bone 表仍是 setup。
+    const float mix_rot = ctx.tf_rotate_mix[ci];
+    const float mix_tr = ctx.tf_translate_mix[ci];
+    const float mix_scl = ctx.tf_scale_mix[ci];
+    const float mix_shr = ctx.tf_shear_mix[ci];
     if (c.target >= ctx.bones.size())
     {
         return;
@@ -416,7 +431,7 @@ void TransformApplyAbsoluteWorld(PoseContext& ctx, const SpineGpuTransformConstr
         BoneState& bone = ctx.bones[bi];
         bool modified = false;
 
-        if (c.rotate_mix != 0.0f)
+        if (mix_rot != 0.0f)
         {
             const float a = bone.a;
             const float b = bone.b;
@@ -431,7 +446,7 @@ void TransformApplyAbsoluteWorld(PoseContext& ctx, const SpineGpuTransformConstr
             {
                 r += kPi2;
             }
-            r *= c.rotate_mix;
+            r *= mix_rot;
             const float cs = std::cos(r);
             const float sn = std::sin(r);
             bone.a = cs * a - sn * cc;
@@ -441,36 +456,36 @@ void TransformApplyAbsoluteWorld(PoseContext& ctx, const SpineGpuTransformConstr
             modified = true;
         }
 
-        if (c.translate_mix != 0.0f)
+        if (mix_tr != 0.0f)
         {
             // `target.localToWorld(offsetX, offsetY)`（Bone.cpp:227-230）
             const float tx = c.offset_x * ta + c.offset_y * tb + t.world_x;
             const float ty = c.offset_x * tc + c.offset_y * td + t.world_y;
-            bone.world_x += (tx - bone.world_x) * c.translate_mix;
-            bone.world_y += (ty - bone.world_y) * c.translate_mix;
+            bone.world_x += (tx - bone.world_x) * mix_tr;
+            bone.world_y += (ty - bone.world_y) * mix_tr;
             modified = true;
         }
 
-        if (c.scale_mix > 0.0f)
+        if (mix_scl > 0.0f)
         {
             float s = Sqrt(bone.a * bone.a + bone.c * bone.c);
             if (s > 0.00001f)
             {
-                s = (s + (Sqrt(ta * ta + tc * tc) - s + c.offset_scale_x) * c.scale_mix) / s;
+                s = (s + (Sqrt(ta * ta + tc * tc) - s + c.offset_scale_x) * mix_scl) / s;
             }
             bone.a *= s;
             bone.c *= s;
             s = Sqrt(bone.b * bone.b + bone.d * bone.d);
             if (s > 0.00001f)
             {
-                s = (s + (Sqrt(tb * tb + td * td) - s + c.offset_scale_y) * c.scale_mix) / s;
+                s = (s + (Sqrt(tb * tb + td * td) - s + c.offset_scale_y) * mix_scl) / s;
             }
             bone.b *= s;
             bone.d *= s;
             modified = true;
         }
 
-        if (c.shear_mix > 0.0f)
+        if (mix_shr > 0.0f)
         {
             const float b = bone.b;
             const float dd = bone.d;
@@ -484,7 +499,7 @@ void TransformApplyAbsoluteWorld(PoseContext& ctx, const SpineGpuTransformConstr
             {
                 r += kPi2;
             }
-            r = by + (r + offset_shear_y) * c.shear_mix;
+            r = by + (r + offset_shear_y) * mix_shr;
             const float s = Sqrt(b * b + dd * dd);
             bone.b = std::cos(r) * s;
             bone.d = std::sin(r) * s;
@@ -499,8 +514,15 @@ void TransformApplyAbsoluteWorld(PoseContext& ctx, const SpineGpuTransformConstr
 }
 
 // TransformConstraint.cpp:218-286
-void TransformApplyRelativeWorld(PoseContext& ctx, const SpineGpuTransformConstraint& c)
+void TransformApplyRelativeWorld(PoseContext& ctx, uint32_t ci)
 {
+    const SpineGpuTransformConstraint& c = ctx.asset.transforms[ci];
+    // ⚠️ 四个 mix 读的是**运行时**值（transform 约束时间轴每帧都可能改），
+    //    不是 `c.*_mix`（那是 setup 常量）。偏移 / target / bone 表仍是 setup。
+    const float mix_rot = ctx.tf_rotate_mix[ci];
+    const float mix_tr = ctx.tf_translate_mix[ci];
+    const float mix_scl = ctx.tf_scale_mix[ci];
+    const float mix_shr = ctx.tf_shear_mix[ci];
     if (c.target >= ctx.bones.size())
     {
         return;
@@ -520,7 +542,7 @@ void TransformApplyRelativeWorld(PoseContext& ctx, const SpineGpuTransformConstr
         BoneState& bone = ctx.bones[bi];
         bool modified = false;
 
-        if (c.rotate_mix != 0.0f)
+        if (mix_rot != 0.0f)
         {
             const float a = bone.a;
             const float b = bone.b;
@@ -535,7 +557,7 @@ void TransformApplyRelativeWorld(PoseContext& ctx, const SpineGpuTransformConstr
             {
                 r += kPi2;
             }
-            r *= c.rotate_mix;
+            r *= mix_rot;
             const float cs = std::cos(r);
             const float sn = std::sin(r);
             bone.a = cs * a - sn * cc;
@@ -545,27 +567,27 @@ void TransformApplyRelativeWorld(PoseContext& ctx, const SpineGpuTransformConstr
             modified = true;
         }
 
-        if (c.translate_mix != 0.0f)
+        if (mix_tr != 0.0f)
         {
             const float tx = c.offset_x * ta + c.offset_y * tb + t.world_x;
             const float ty = c.offset_x * tc + c.offset_y * td + t.world_y;
-            bone.world_x += tx * c.translate_mix;
-            bone.world_y += ty * c.translate_mix;
+            bone.world_x += tx * mix_tr;
+            bone.world_y += ty * mix_tr;
             modified = true;
         }
 
-        if (c.scale_mix > 0.0f)
+        if (mix_scl > 0.0f)
         {
-            float s = (Sqrt(ta * ta + tc * tc) - 1.0f + c.offset_scale_x) * c.scale_mix + 1.0f;
+            float s = (Sqrt(ta * ta + tc * tc) - 1.0f + c.offset_scale_x) * mix_scl + 1.0f;
             bone.a *= s;
             bone.c *= s;
-            s = (Sqrt(tb * tb + td * td) - 1.0f + c.offset_scale_y) * c.scale_mix + 1.0f;
+            s = (Sqrt(tb * tb + td * td) - 1.0f + c.offset_scale_y) * mix_scl + 1.0f;
             bone.b *= s;
             bone.d *= s;
             modified = true;
         }
 
-        if (c.shear_mix > 0.0f)
+        if (mix_shr > 0.0f)
         {
             float r = Atan2(td, tb) - Atan2(tc, ta);
             if (r > kPi)
@@ -578,7 +600,7 @@ void TransformApplyRelativeWorld(PoseContext& ctx, const SpineGpuTransformConstr
             }
             const float b = bone.b;
             const float dd = bone.d;
-            r = Atan2(dd, b) + (r - kPi / 2.0f + offset_shear_y) * c.shear_mix;
+            r = Atan2(dd, b) + (r - kPi / 2.0f + offset_shear_y) * mix_shr;
             const float s = Sqrt(b * b + dd * dd);
             bone.b = std::cos(r) * s;
             bone.d = std::sin(r) * s;
@@ -600,8 +622,15 @@ void TransformApplyRelativeWorld(PoseContext& ctx, const SpineGpuTransformConstr
 //    **照抄**（改成 `shearY +=` 会与参考实现对不上，且不报错）。
 //    副作用：被改的 `shear_y` 会在**后续** `Bone::update()` 里生效
 //    （`update()` 读的是局部值）⇒ 必须真的写进 `shear_y`，不能省。
-void TransformApplyAbsoluteLocal(PoseContext& ctx, const SpineGpuTransformConstraint& c)
+void TransformApplyAbsoluteLocal(PoseContext& ctx, uint32_t ci)
 {
+    const SpineGpuTransformConstraint& c = ctx.asset.transforms[ci];
+    // ⚠️ 四个 mix 读的是**运行时**值（transform 约束时间轴每帧都可能改），
+    //    不是 `c.*_mix`（那是 setup 常量）。偏移 / target / bone 表仍是 setup。
+    const float mix_rot = ctx.tf_rotate_mix[ci];
+    const float mix_tr = ctx.tf_translate_mix[ci];
+    const float mix_scl = ctx.tf_scale_mix[ci];
+    const float mix_shr = ctx.tf_shear_mix[ci];
     EnsureApplied(ctx, c.target);
     const BoneState& t = ctx.bones[c.target];
 
@@ -612,41 +641,41 @@ void TransformApplyAbsoluteLocal(PoseContext& ctx, const SpineGpuTransformConstr
         BoneState& bone = ctx.bones[bi];
 
         float rotation = bone.arotation;
-        if (c.rotate_mix != 0.0f)
+        if (mix_rot != 0.0f)
         {
             float r = t.arotation - rotation + c.offset_rotation;
             r = WrapDegrees(r);
-            rotation += r * c.rotate_mix;
+            rotation += r * mix_rot;
         }
 
         float x = bone.ax;
         float y = bone.ay;
-        if (c.translate_mix != 0.0f)
+        if (mix_tr != 0.0f)
         {
-            x += (t.ax - x + c.offset_x) * c.translate_mix;
-            y += (t.ay - y + c.offset_y) * c.translate_mix;
+            x += (t.ax - x + c.offset_x) * mix_tr;
+            y += (t.ay - y + c.offset_y) * mix_tr;
         }
 
         float scale_x = bone.ascale_x;
         float scale_y = bone.ascale_y;
-        if (c.scale_mix != 0.0f)
+        if (mix_scl != 0.0f)
         {
             if (scale_x > 0.00001f)
             {
-                scale_x = (scale_x + (t.ascale_x - scale_x + c.offset_scale_x) * c.scale_mix) / scale_x;
+                scale_x = (scale_x + (t.ascale_x - scale_x + c.offset_scale_x) * mix_scl) / scale_x;
             }
             if (scale_y > 0.00001f)
             {
-                scale_y = (scale_y + (t.ascale_y - scale_y + c.offset_scale_y) * c.scale_mix) / scale_y;
+                scale_y = (scale_y + (t.ascale_y - scale_y + c.offset_scale_y) * mix_scl) / scale_y;
             }
         }
 
         const float shear_y = bone.ashear_y;
-        if (c.shear_mix != 0.0f)
+        if (mix_shr != 0.0f)
         {
             float r = t.ashear_y - shear_y + c.offset_shear_y;
             r = WrapDegrees(r);
-            bone.shear_y += r * c.shear_mix;   // ⚠️ 写的是**局部**量（参考实现就是这样）
+            bone.shear_y += r * mix_shr;   // ⚠️ 写的是**局部**量（参考实现就是这样）
         }
 
         UpdateWorldTransform(ctx, bi, x, y, rotation, scale_x, scale_y, bone.ashear_x, shear_y);
@@ -654,8 +683,15 @@ void TransformApplyAbsoluteLocal(PoseContext& ctx, const SpineGpuTransformConstr
 }
 
 // TransformConstraint.cpp:338-382
-void TransformApplyRelativeLocal(PoseContext& ctx, const SpineGpuTransformConstraint& c)
+void TransformApplyRelativeLocal(PoseContext& ctx, uint32_t ci)
 {
+    const SpineGpuTransformConstraint& c = ctx.asset.transforms[ci];
+    // ⚠️ 四个 mix 读的是**运行时**值（transform 约束时间轴每帧都可能改），
+    //    不是 `c.*_mix`（那是 setup 常量）。偏移 / target / bone 表仍是 setup。
+    const float mix_rot = ctx.tf_rotate_mix[ci];
+    const float mix_tr = ctx.tf_translate_mix[ci];
+    const float mix_scl = ctx.tf_scale_mix[ci];
+    const float mix_shr = ctx.tf_shear_mix[ci];
     EnsureApplied(ctx, c.target);
     const BoneState& t = ctx.bones[c.target];
 
@@ -666,37 +702,37 @@ void TransformApplyRelativeLocal(PoseContext& ctx, const SpineGpuTransformConstr
         BoneState& bone = ctx.bones[bi];
 
         float rotation = bone.arotation;
-        if (c.rotate_mix != 0.0f)
+        if (mix_rot != 0.0f)
         {
-            rotation += (t.arotation + c.offset_rotation) * c.rotate_mix;
+            rotation += (t.arotation + c.offset_rotation) * mix_rot;
         }
 
         float x = bone.ax;
         float y = bone.ay;
-        if (c.translate_mix != 0.0f)
+        if (mix_tr != 0.0f)
         {
-            x += (t.ax + c.offset_x) * c.translate_mix;
-            y += (t.ay + c.offset_y) * c.translate_mix;
+            x += (t.ax + c.offset_x) * mix_tr;
+            y += (t.ay + c.offset_y) * mix_tr;
         }
 
         float scale_x = bone.ascale_x;
         float scale_y = bone.ascale_y;
-        if (c.scale_mix != 0.0f)
+        if (mix_scl != 0.0f)
         {
             if (scale_x > 0.00001f)
             {
-                scale_x *= ((t.ascale_x - 1.0f + c.offset_scale_x) * c.scale_mix) + 1.0f;
+                scale_x *= ((t.ascale_x - 1.0f + c.offset_scale_x) * mix_scl) + 1.0f;
             }
             if (scale_y > 0.00001f)
             {
-                scale_y *= ((t.ascale_y - 1.0f + c.offset_scale_y) * c.scale_mix) + 1.0f;
+                scale_y *= ((t.ascale_y - 1.0f + c.offset_scale_y) * mix_scl) + 1.0f;
             }
         }
 
         float shear_y = bone.ashear_y;
-        if (c.shear_mix != 0.0f)
+        if (mix_shr != 0.0f)
         {
-            shear_y += (t.ashear_y + c.offset_shear_y) * c.shear_mix;
+            shear_y += (t.ashear_y + c.offset_shear_y) * mix_shr;
         }
 
         UpdateWorldTransform(ctx, bi, x, y, rotation, scale_x, scale_y, bone.ashear_x, shear_y);
@@ -1849,15 +1885,17 @@ SpineImportResult SpineGpuUpdateWorld(const SpineGpuAsset& asset, const SpineGpu
     {
         return Fail("update: 状态 / 查找表与资产的条数不一致（不是用这个资产初始化的）");
     }
+    // 约束运行时参数数组必须与约束条数一致 —— 它们只在 `SpineGpuSetBonesToSetupPose()` 里定值，
+    // 长度不对 = 状态不是用这个资产初始化的（读下去是越界，不报错）
+    if (state.ik_mix.size() != asset.iks.size() || state.tf_rotate_mix.size() != asset.transforms.size())
+    {
+        return Fail("update: 约束运行时参数的条数与资产不一致（不是用这个资产初始化的）");
+    }
 
     thread_local PoseScratch scratch;
-    PoseContext ctx(asset, state.bones, scratch);
-
-    // ---- 1) path 约束的运行时参数（时间轴写完后的值）----
-    ctx.path_position = state.path_position;
-    ctx.path_spacing = state.path_spacing;
-    ctx.path_rotate_mix = state.path_rotate_mix;
-    ctx.path_translate_mix = state.path_translate_mix;
+    // 约束的运行时参数（path / IK / transform）**不再是拷贝**：PoseContext 直接引用状态里的
+    // 数组 —— 它们每帧都会被时间轴改写，拷贝一份只是多付 8 次 assign 且容易两份漂移。
+    PoseContext ctx(asset, state.bones, state, scratch);
 
     // ---- 2) 每条 path 约束**当前**用的那条附件 ----
     // `PathConstraint::update()` 取 `_target->getAttachment()` —— 槽位当前挂的附件。
@@ -1964,8 +2002,10 @@ SpineImportResult SpineGpuUpdateWorld(const SpineGpuAsset& asset, const SpineGpu
                         return Fail("update: 执行步骤里的 IK 下标 " + std::to_string(step.index) + " 越界");
                     }
                     const SpineGpuIkConstraint& c = asset.iks[step.index];
-                    const bool compress = (c.flags & SpineGpuIkFlags::kIkFlagCompress) != 0;
-                    const bool stretch = (c.flags & SpineGpuIkFlags::kIkFlagStretch) != 0;
+                    // ⚠️ compress / stretch / mix / bend 读的是**运行时**值（IK 时间轴每帧都可能改）；
+                    //    只有 `uniform` 是 setup 常量（没有时间轴改它）。
+                    const bool compress = ctx.ik_compress[step.index] != 0;
+                    const bool stretch = ctx.ik_stretch[step.index] != 0;
                     const bool uniform = (c.flags & SpineGpuIkFlags::kIkFlagUniform) != 0;
                     if (c.bone_count == 0)
                     {
@@ -1984,7 +2024,8 @@ SpineImportResult SpineGpuUpdateWorld(const SpineGpuAsset& asset, const SpineGpu
                             return Fail("update: IK 约束 " + std::to_string(step.index) +
                                         " 的骨骼没有父骨骼（参考实现在这里是空指针解引用）");
                         }
-                        IkApplyOneBone(ctx, bi, target.world_x, target.world_y, compress, stretch, uniform, c.mix);
+                        IkApplyOneBone(ctx, bi, target.world_x, target.world_y, compress, stretch, uniform,
+                                       ctx.ik_mix[step.index]);
                     }
                     else
                     {
@@ -1996,8 +2037,8 @@ SpineImportResult SpineGpuUpdateWorld(const SpineGpuAsset& asset, const SpineGpu
                             return Fail("update: IK 约束 " + std::to_string(step.index) +
                                         " 的父骨骼没有父骨骼（参考实现在这里是空指针解引用）");
                         }
-                        IkApplyTwoBones(ctx, parent_i, child_i, target.world_x, target.world_y, c.bend_dir, stretch,
-                                        c.mix);
+                        IkApplyTwoBones(ctx, parent_i, child_i, target.world_x, target.world_y,
+                                        ctx.ik_bend_dir[step.index], stretch, ctx.ik_mix[step.index]);
                     }
                     break;
                 }
@@ -2018,22 +2059,22 @@ SpineImportResult SpineGpuUpdateWorld(const SpineGpuAsset& asset, const SpineGpu
                     {
                         if (relative)
                         {
-                            TransformApplyRelativeLocal(ctx, c);
+                            TransformApplyRelativeLocal(ctx, step.index);
                         }
                         else
                         {
-                            TransformApplyAbsoluteLocal(ctx, c);
+                            TransformApplyAbsoluteLocal(ctx, step.index);
                         }
                     }
                     else
                     {
                         if (relative)
                         {
-                            TransformApplyRelativeWorld(ctx, c);
+                            TransformApplyRelativeWorld(ctx, step.index);
                         }
                         else
                         {
-                            TransformApplyAbsoluteWorld(ctx, c, step.index);
+                            TransformApplyAbsoluteWorld(ctx, step.index);
                         }
                     }
                     break;

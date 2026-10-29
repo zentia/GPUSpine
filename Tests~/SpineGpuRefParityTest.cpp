@@ -60,6 +60,7 @@
 #include "SpineGpuJsonFixture.h"
 #include "SpineGpuAnimationState.h"
 #include "SpineGpuBatch.h"
+#include "SpineGpuConstraintFixture.h"
 #include "SpineGpuEventFixture.h"
 #include "SpineGpuSkinFixture.h"
 #include "SpineGpuClipper.h"
@@ -397,6 +398,14 @@ struct S5Stats
     size_t dark_negative = 0;           // 其中有分量 < 0（TwoColor 首帧前的符号 bug 路径）
     size_t dark_best = 0;
     std::string dark_best_asset;
+    // ---- 约束参数时间轴（IK / transform / pathSpacing）----
+    // ⚠️ 这里**直接比运行时参数**而不是只看骨骼世界坐标：骨骼对上了只说明"整条链没错"，
+    //    参数对上了才说明这三条 apply 本身没写反；而且参数分叉能在第一时间指出是哪一类。
+    //    OSGame 782 个资产对这三类时间轴的覆盖面是 0 ⇒ `constraint_param_moved` 全靠夹具。
+    size_t constraint_param_checks = 0;   // 比过的参数个数（每帧 × 每约束 × 每参数）
+    size_t constraint_param_moved = 0;    // 其中"不等于 setup"的个数（= 时间轴真的起了作用）
+    size_t constraint_param_diff = 0;     // 与参考实现对不上的个数
+    std::string constraint_param_first;   // 第一个对不上的描述
     size_t clip_scope_checks = 0;       // 可画槽位"在不在作用域里"的比较
     size_t clip_core_calls = 0;         // 同输入 clipTriangles 的逐位比较次数
     size_t clip_core_out_vertices = 0;  // 其中输出的顶点数
@@ -1231,6 +1240,94 @@ std::string S5CompareClip(const SpineGpuAsset& asset, const SpineGpuSkeletonStat
     return std::string();
 }
 
+// 约束**运行时参数**的逐帧对拍（IK / transform / path）。在 `ours.Apply(st)` 与
+// `ref.apply(ref_skel)` 之后、`updateWorld` 之前调用 —— 这正是"时间轴写完了、约束还没解算"
+// 的时刻，参数是时间轴的**唯一**输出。
+//
+// 为什么单独比一遍：这三类时间轴在 OSGame 782 个资产上覆盖面为 0，靠骨骼世界坐标对拍
+// 是验不到的；而夹具里若解算器读成 setup 常量，骨骼坐标也会分叉 —— 那时只知道"错了"，
+// 不知道错在"参数没写进去"还是"约束解算读错了"。这里把两者分开。
+void CheckConstraintParams(const SpineGpuAsset& asset, const SpineGpuSkeletonState& st, spine::Skeleton& ref_skel,
+                          const std::string& short_path, size_t script, size_t frame, S5Stats& s5)
+{
+    // 每帧都拼消息串是 27 万次分配 ⇒ 只在**第一次**分叉时拼
+    char wbuf[320];
+    const char* where = "";
+    const auto fill_where = [&]() {
+        std::snprintf(wbuf, sizeof(wbuf), "%s 脚本 %zu 第 %zu 帧", short_path.c_str(), script, frame);
+        where = wbuf;
+        return where;
+    };
+    const size_t n_ik = asset.iks.size();
+    const size_t n_tf = asset.transforms.size();
+    const size_t n_path = asset.paths.size();
+    if (n_ik != ref_skel.getIkConstraints().size() || n_tf != ref_skel.getTransformConstraints().size() ||
+        n_path != ref_skel.getPathConstraints().size())
+    {
+        ++s5.constraint_param_diff;
+        if (s5.constraint_param_first.empty())
+        {
+            s5.constraint_param_first = std::string(fill_where()) + "：约束条数不一致";
+        }
+        return;
+    }
+    char buf[256];
+    const auto cmp = [&](const char* what, size_t i, float ours, float ref_v, float setup) {
+        ++s5.constraint_param_checks;
+        if (ours != setup)
+        {
+            ++s5.constraint_param_moved;
+        }
+        if (!(std::fabs(ours - ref_v) <= 1e-6f * (std::fabs(ref_v) > 1.0f ? std::fabs(ref_v) : 1.0f)))
+        {
+            ++s5.constraint_param_diff;
+            if (s5.constraint_param_first.empty())
+            {
+                std::snprintf(buf, sizeof(buf), "%s：%s[%zu] 我们 %.9g vs 参考 %.9g（setup %.9g）", fill_where(),
+                              what, i,
+                              static_cast<double>(ours), static_cast<double>(ref_v), static_cast<double>(setup));
+                s5.constraint_param_first = buf;
+            }
+        }
+    };
+    const auto cmp_int = [&](const char* what, size_t i, int ours, int ref_v) {
+        ++s5.constraint_param_checks;
+        if (ours != ref_v)
+        {
+            ++s5.constraint_param_diff;
+            if (s5.constraint_param_first.empty())
+            {
+                std::snprintf(buf, sizeof(buf), "%s：%s[%zu] 我们 %d vs 参考 %d", fill_where(), what, i, ours, ref_v);
+                s5.constraint_param_first = buf;
+            }
+        }
+    };
+    for (size_t i = 0; i < n_ik; ++i)
+    {
+        spine::IkConstraint* c = ref_skel.getIkConstraints()[i];
+        cmp("ik.mix", i, st.ik_mix[i], c->getMix(), asset.iks[i].mix);
+        cmp_int("ik.bendDir", i, st.ik_bend_dir[i], c->getBendDirection());
+        cmp_int("ik.compress", i, static_cast<int>(st.ik_compress[i]), c->getCompress() ? 1 : 0);
+        cmp_int("ik.stretch", i, static_cast<int>(st.ik_stretch[i]), c->getStretch() ? 1 : 0);
+    }
+    for (size_t i = 0; i < n_tf; ++i)
+    {
+        spine::TransformConstraint* c = ref_skel.getTransformConstraints()[i];
+        cmp("tf.rotateMix", i, st.tf_rotate_mix[i], c->getRotateMix(), asset.transforms[i].rotate_mix);
+        cmp("tf.translateMix", i, st.tf_translate_mix[i], c->getTranslateMix(), asset.transforms[i].translate_mix);
+        cmp("tf.scaleMix", i, st.tf_scale_mix[i], c->getScaleMix(), asset.transforms[i].scale_mix);
+        cmp("tf.shearMix", i, st.tf_shear_mix[i], c->getShearMix(), asset.transforms[i].shear_mix);
+    }
+    for (size_t i = 0; i < n_path; ++i)
+    {
+        spine::PathConstraint* c = ref_skel.getPathConstraints()[i];
+        cmp("path.position", i, st.path_position[i], c->getPosition(), asset.paths[i].position);
+        cmp("path.spacing", i, st.path_spacing[i], c->getSpacing(), asset.paths[i].spacing);
+        cmp("path.rotateMix", i, st.path_rotate_mix[i], c->getRotateMix(), asset.paths[i].rotate_mix);
+        cmp("path.translateMix", i, st.path_translate_mix[i], c->getTranslateMix(), asset.paths[i].translate_mix);
+    }
+}
+
 bool RunS5(const fs::path& skel_path, const SpineGpuAsset& asset, spine::SkeletonData* ref_data, size_t scripts,
            size_t frames, size_t max_details, S5Stats& s5)
 {
@@ -1603,6 +1700,12 @@ bool RunS5(const fs::path& skel_path, const SpineGpuAsset& asset, spine::Skeleto
             ref.update(dt);
             r = ours.Apply(st);
             ref.apply(ref_skel);
+            // 约束运行时参数（IK / transform / path）的**语义对拍**：时间轴的唯一输出就是它们，
+            // 且 OSGame 782 个资产对这三类时间轴的覆盖面是 0 ⇒ 只有夹具能验（见 S5Stats 上的注释）
+            if (r.ok)
+            {
+                CheckConstraintParams(asset, st, ref_skel, short_path, sc, f, s5);
+            }
             SpineGpuPoseResult pose;
             if (r.ok)
             {
@@ -1775,6 +1878,12 @@ bool RunSkinFixture(size_t scripts, size_t frames, size_t max_details, S5Stats& 
                           max_details, s5);
 }
 
+bool RunConstraintFixture(size_t scripts, size_t frames, size_t max_details, S5Stats& s5)
+{
+    return RunJsonFixture("constraints.json", SpineGpuConstraintFixture::kAtlas, SpineGpuConstraintFixture::kSkeleton,
+                          scripts, frames, max_details, s5);
+}
+
 int main(int argc, char** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // 不缓冲：经 MSYS 管道重定向时，缓冲的输出在进程退出时会丢（实测；与 SpineGpuBenchmark 同一招）
@@ -1897,6 +2006,9 @@ int main(int argc, char** argv)
         // 用户事件夹具（v16）：OSGame 没有用户事件 ⇒ 这里 + spine-runtimes 官方示例是事件的参考对拍
         RunJsonFixture("events.json", SpineGpuEventFixture::kAtlas, SpineGpuEventFixture::kSkeleton, 64, 300,
                        max_details, s5);
+        // 约束参数时间轴夹具（IK / transform / pathSpacing）：OSGame 用到这三类时间轴的资产数是
+        // 0 ⇒ 这是它们唯一的参考对拍（换肤 / 事件夹具同理）
+        RunConstraintFixture(64, 300, max_details, s5);
     }
     for (const fs::path& skel_path : files)
     {
@@ -3028,6 +3140,12 @@ int main(int argc, char** argv)
         std::printf("  └ bbox / point 的 deform（烘焙期不收，跳过）: %zu 次；槽位挂裁剪附件 %zu 次\n",
                     s5.deform_skipped_unbaked, s5.clip_attach_checks);
         std::printf("绘制顺序比较         : %zu\n", s5.draw_order_checks);
+        std::printf("约束运行时参数       : %zu 次比较，其中不等于 setup 的 %zu 次，与参考对不上 %zu\n",
+                    s5.constraint_param_checks, s5.constraint_param_moved, s5.constraint_param_diff);
+        if (!s5.constraint_param_first.empty())
+        {
+            std::printf("  └ 第一个: %s\n", s5.constraint_param_first.c_str());
+        }
         std::printf("裁剪（v15）          : %zu 帧开始过裁剪，可画槽位作用域比较 %zu 次\n", s5.clip_frames,
                     s5.clip_scope_checks);
         std::printf("  └ 同输入 clipTriangles 逐位: %zu 次（输出 %zu 顶点，clipStart 凸块 %zu）\n", s5.clip_core_calls,
@@ -3088,7 +3206,18 @@ int main(int argc, char** argv)
                     static_cast<double>(s5.clip_e2e_worst_rigid), static_cast<double>(kMaxWorldRigid),
                     static_cast<double>(s5.clip_e2e_worst_rigid_uv), static_cast<double>(kMaxUvRigid));
     }
-    const bool pass = st.mismatches == 0 && s5.assets_bad == 0 && clip_e2e_ok;
+    // 约束参数时间轴（IK / transform / pathSpacing）：OSGame 覆盖面是 0 ⇒ 夹具必须真的把
+    // 参数从 setup 上推离过（`constraint_param_moved != 0`）。少了这条，"夹具没加载成功 /
+    // 时间轴被静默跳过"会表现成"三次比较全对、verdict PASS"。
+    bool constraint_ok = true;
+    if (run_s5)
+    {
+        constraint_ok = s5.constraint_param_diff == 0 && s5.constraint_param_moved != 0;
+        std::printf("约束参数时间轴       : %s（对不上 %zu；偏离 setup %zu%s）\n", constraint_ok ? "OK" : "FAIL",
+                    s5.constraint_param_diff, s5.constraint_param_moved,
+                    s5.constraint_param_moved == 0 ? " ← 覆盖面为 0，夹具没起作用" : "");
+    }
+    const bool pass = st.mismatches == 0 && s5.assets_bad == 0 && clip_e2e_ok && constraint_ok;
     std::printf("\n=== verdict: %s ===\n", pass ? "PASS" : "FAIL");
 
     return pass ? 0 : 1;

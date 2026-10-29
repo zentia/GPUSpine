@@ -690,6 +690,281 @@ SpineImportResult ApplyPathMix(const SpineGpuAsset& asset, SpineGpuSkeletonState
 }
 
 // ---------------------------------------------------------------------
+// 约束参数时间轴（IK / transform / pathSpacing）
+//
+// 这三类**不改骨骼 / 槽位**，只改"约束这一帧用多少权重"。它们是多轨混合里最典型的
+// 参数轨：轨道 A 淡出时它的 IK mix 要从 1 渐变到 0，而 setup 值恒为 1 ⇒ 少了这一层，
+// 交叉淡入淡出的姿势会静默错（不报错、看起来"能跑"）。
+// ---------------------------------------------------------------------
+
+// 单值 + 曲线的时间轴在 `time` 处的采样（pathSpacing / IK mix 的插值部分）。
+// 调用方保证 `time >= frames[0] && time < LastTime()`。
+SpineImportResult SampleOne(const SpineGpuAsset& asset, uint32_t tl_index, const SpineGpuTimelineRt& rt, float time,
+                            float& v)
+{
+    const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
+    float percent = 0.0f;
+    const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
+    if (!cr.ok)
+    {
+        return cr;
+    }
+    v = rt.frames[static_cast<size_t>(cur) - rt.entries + 1u];
+    v += (rt.frames[cur + 1u] - v) * percent;
+    return Ok();
+}
+
+// IkConstraintTimeline.cpp:65-143
+//
+// ⚠️ 参考实现有三处不对称，都要照抄，否则与它对不上且不报错：
+//   a) `direction == MixDirection_Out` 时把 bend / compress / stretch 复位成 **setup**
+//      （`Setup` 分支）或**干脆不写**（`Replace / First` 分支）—— 淡出走的就是 Out；
+//   b) `MixBlend_Setup` 分支里 `bendDirection` 读的是 `_frames[_frames.size() + PREV_BEND_DIRECTION]`
+//      = **最后一帧**的 bend，而同一处的 compress / stretch 读的是 `frame + PREV_*`
+//      = **前一帧**。这是 3.8 的笔误（末帧分支里 `_frames.size()` 恰好等价，插值分支里
+//      不等价）⇒ 只有 `Setup` 这一支用 `rt.Last(2)`。
+//   c) `Replace / First` 分支读的是 `frame + PREV_BEND_DIRECTION`（前一帧）—— **没有**笔误。
+//      第一次实现时把 (b) 当成通例写进了两支，夹具立刻分叉（`ik.bendDir 我们 1 vs 参考 -1`）。
+SpineImportResult ApplyIkConstraint(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
+                                    const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend,
+                                    SpineGpuMixDirection direction)
+{
+    if (rt.target >= st.ik_mix.size())
+    {
+        return Fail("apply: " + TlName(tl_index) + "（ik）的约束下标越界");
+    }
+    const SpineGpuIkConstraint& data = asset.iks[rt.target];
+    float& mix = st.ik_mix[rt.target];
+    const bool out = direction == SpineGpuMixDirection::kOut;
+
+    // setup 那三个布尔 / 整数值（压缩到 flags 里的两个）
+    const auto reset_dir = [&]() {
+        st.ik_bend_dir[rt.target] = data.bend_dir;
+        st.ik_compress[rt.target] = (data.flags & SpineGpuIkFlags::kIkFlagCompress) != 0 ? 1u : 0u;
+        st.ik_stretch[rt.target] = (data.flags & SpineGpuIkFlags::kIkFlagStretch) != 0 ? 1u : 0u;
+    };
+
+    if (time < rt.FirstTime())
+    {
+        switch (blend)
+        {
+            case SpineGpuMixBlend::kSetup:
+                mix = data.mix;
+                reset_dir();
+                return Ok();
+            case SpineGpuMixBlend::kFirst:
+                mix += (data.mix - mix) * alpha;   // ⚠️ 只有 mix 走 alpha，三个开关是直接赋值
+                reset_dir();
+                return Ok();
+            default:
+                return Ok();
+        }
+    }
+
+    // 帧上的 bend / compress / stretch。`base` = 该帧的起始下标；`setup_branch` 为真时
+    // bend 取**末帧**（参考实现的笔误，见上面第 b 条），否则取这一帧（第 c 条）。
+    const auto set_dir_from_frame = [&](uint32_t base, bool setup_branch) {
+        const float bend = setup_branch ? rt.Last(2) : rt.frames[base + 2u];
+        st.ik_bend_dir[rt.target] = static_cast<int32_t>(bend);
+        st.ik_compress[rt.target] = rt.frames[base + 3u] != 0.0f ? 1u : 0u;
+        st.ik_stretch[rt.target] = rt.frames[base + 4u] != 0.0f ? 1u : 0u;
+    };
+    const uint32_t last_base = static_cast<uint32_t>((static_cast<size_t>(rt.frame_count) - 1u) * rt.entries);
+
+    if (time >= rt.LastTime())
+    {
+        // 末帧：`_frames[_frames.size() + PREV_*]` = `Last(k)`
+        if (blend == SpineGpuMixBlend::kSetup)
+        {
+            mix = data.mix + (rt.Last(1) - data.mix) * alpha;
+            if (out)
+            {
+                reset_dir();
+            }
+            else
+            {
+                set_dir_from_frame(last_base, true);
+            }
+        }
+        else
+        {
+            mix += (rt.Last(1) - mix) * alpha;
+            if (!out)
+            {
+                set_dir_from_frame(last_base, false);
+            }
+        }
+        return Ok();
+    }
+
+    const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
+    float percent = 0.0f;
+    const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
+    if (!cr.ok)
+    {
+        return cr;
+    }
+    const size_t prev = static_cast<size_t>(cur) - rt.entries;
+    float frame_mix = rt.frames[prev + 1u];
+    frame_mix += (rt.frames[cur + 1u] - frame_mix) * percent;
+
+    if (blend == SpineGpuMixBlend::kSetup)
+    {
+        mix = data.mix + (frame_mix - data.mix) * alpha;
+        if (out)
+        {
+            reset_dir();
+        }
+        else
+        {
+            set_dir_from_frame(static_cast<uint32_t>(prev), true);
+        }
+    }
+    else
+    {
+        mix += (frame_mix - mix) * alpha;
+        if (!out)
+        {
+            set_dir_from_frame(static_cast<uint32_t>(prev), false);
+        }
+    }
+    return Ok();
+}
+
+// TransformConstraintTimeline.cpp:66-131（`direction` 全程没用到 —— `SP_UNUSED(direction)`）
+SpineImportResult ApplyTransformConstraint(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
+                                           const SpineGpuTimelineRt& rt, float time, float alpha,
+                                           SpineGpuMixBlend blend)
+{
+    if (rt.target >= st.tf_rotate_mix.size())
+    {
+        return Fail("apply: " + TlName(tl_index) + "（transform）的约束下标越界");
+    }
+    const SpineGpuTransformConstraint& data = asset.transforms[rt.target];
+    float& rm = st.tf_rotate_mix[rt.target];
+    float& tm = st.tf_translate_mix[rt.target];
+    float& sm = st.tf_scale_mix[rt.target];
+    float& hm = st.tf_shear_mix[rt.target];
+
+    if (time < rt.FirstTime())
+    {
+        switch (blend)
+        {
+            case SpineGpuMixBlend::kSetup:
+                rm = data.rotate_mix;
+                tm = data.translate_mix;
+                sm = data.scale_mix;
+                hm = data.shear_mix;
+                return Ok();
+            case SpineGpuMixBlend::kFirst:
+                rm += (data.rotate_mix - rm) * alpha;
+                tm += (data.translate_mix - tm) * alpha;
+                sm += (data.scale_mix - sm) * alpha;
+                hm += (data.shear_mix - hm) * alpha;
+                return Ok();
+            default:
+                return Ok();
+        }
+    }
+
+    float rotate = 0.0f;
+    float translate = 0.0f;
+    float scale = 0.0f;
+    float shear = 0.0f;
+    if (time >= rt.LastTime())
+    {
+        // 末帧：`_frames[i + PREV_*]`（`i = _frames.size()`）⇒ 就是 `Last(k)`
+        rotate = rt.Last(1);
+        translate = rt.Last(2);
+        scale = rt.Last(3);
+        shear = rt.Last(4);
+    }
+    else
+    {
+        const uint32_t cur = SpineGpuBinarySearchFrames(rt.frames, rt.frame_count, rt.entries, time);
+        float percent = 0.0f;
+        const SpineImportResult cr = SpineGpuCurvePercentAt(asset, rt, tl_index, cur, time, percent);
+        if (!cr.ok)
+        {
+            return cr;
+        }
+        const size_t prev = static_cast<size_t>(cur) - rt.entries;
+        rotate = rt.frames[prev + 1u];
+        translate = rt.frames[prev + 2u];
+        scale = rt.frames[prev + 3u];
+        shear = rt.frames[prev + 4u];
+        rotate += (rt.frames[cur + 1u] - rotate) * percent;
+        translate += (rt.frames[cur + 2u] - translate) * percent;
+        scale += (rt.frames[cur + 3u] - scale) * percent;
+        shear += (rt.frames[cur + 4u] - shear) * percent;
+    }
+
+    if (blend == SpineGpuMixBlend::kSetup)
+    {
+        rm = data.rotate_mix + (rotate - data.rotate_mix) * alpha;
+        tm = data.translate_mix + (translate - data.translate_mix) * alpha;
+        sm = data.scale_mix + (scale - data.scale_mix) * alpha;
+        hm = data.shear_mix + (shear - data.shear_mix) * alpha;
+    }
+    else
+    {
+        rm += (rotate - rm) * alpha;
+        tm += (translate - tm) * alpha;
+        sm += (scale - sm) * alpha;
+        hm += (shear - hm) * alpha;
+    }
+    return Ok();
+}
+
+// PathConstraintSpacingTimeline.cpp:54-95（与 `ApplyPathPosition` 同形，只是字段不同）
+SpineImportResult ApplyPathSpacing(const SpineGpuAsset& asset, SpineGpuSkeletonState& st, uint32_t tl_index,
+                                   const SpineGpuTimelineRt& rt, float time, float alpha, SpineGpuMixBlend blend)
+{
+    if (rt.target >= st.path_spacing.size())
+    {
+        return Fail("apply: " + TlName(tl_index) + "（pathSpacing）的约束下标越界");
+    }
+    float& sp = st.path_spacing[rt.target];
+    const float setup = asset.paths[rt.target].spacing;
+    if (time < rt.FirstTime())
+    {
+        switch (blend)
+        {
+            case SpineGpuMixBlend::kSetup:
+                sp = setup;
+                return Ok();
+            case SpineGpuMixBlend::kFirst:
+                sp += (setup - sp) * alpha;
+                return Ok();
+            default:
+                return Ok();
+        }
+    }
+    float spacing;
+    if (time >= rt.LastTime())
+    {
+        spacing = rt.Last(1);
+    }
+    else
+    {
+        const SpineImportResult sr = SampleOne(asset, tl_index, rt, time, spacing);
+        if (!sr.ok)
+        {
+            return sr;
+        }
+    }
+    if (blend == SpineGpuMixBlend::kSetup)
+    {
+        sp = setup + (spacing - setup) * alpha;
+    }
+    else
+    {
+        sp += (spacing - sp) * alpha;
+    }
+    return Ok();
+}
+
+// ---------------------------------------------------------------------
 // deform
 // ---------------------------------------------------------------------
 
@@ -1454,6 +1729,22 @@ SpineImportResult SpineGpuBuildRuntimeData(const SpineGpuAsset& asset, SpineGpuR
                 return Fail("runtime: " + TlName(ti) + "的 path 约束下标越界");
             }
         }
+        else if (type == SpineTimelineType::kIkConstraint)
+        {
+            // 缺了这条，apply 里拿到的是"约束条数为 0 ⇒ 数组空 ⇒ 下标越界报错"，
+            // 但更早的位置（这里是全部时间轴扫一遍）能把"容器坏了"和"资产真的没有 IK"分开。
+            if (tl.target >= asset.iks.size())
+            {
+                return Fail("runtime: " + TlName(ti) + "的 IK 约束下标越界");
+            }
+        }
+        else if (type == SpineTimelineType::kTransformConstraint)
+        {
+            if (tl.target >= asset.transforms.size())
+            {
+                return Fail("runtime: " + TlName(ti) + "的 transform 约束下标越界");
+            }
+        }
     }
 
     // ---- 每个皮肤的 (槽位, 名字) → 附件表（`Skin::getAttachment`）----
@@ -1669,8 +1960,40 @@ void SpineGpuSetBonesToSetupPose(const SpineGpuAsset& asset, SpineGpuSkeletonSta
         s.shear_x = b.shear_x;
         s.shear_y = b.shear_y;
     }
-    // 约束运行时参数（IK / transform 的恒等于 setup，没有存 —— 见头文件）
-    for (size_t i = 0; i < asset.paths.size() && i < state.path_position.size(); ++i)
+    // 约束运行时参数（Skeleton.cpp:223-258）。
+    // ⚠️ 用 `assign` 而不是逐条赋值：这些数组必须与 `asset.iks / transforms / paths` 等长，
+    //    而 `SpineGpuSetBonesToSetupPose()` 是**唯一**给它们定值的地方；少一次同步就
+    //    会出现"约束条数对了、参数数组还是上一份资产的长度"（越界读，不报错）。
+    const size_t ik_n = asset.iks.size();
+    state.ik_mix.assign(ik_n, 0.0f);
+    state.ik_bend_dir.assign(ik_n, 0);
+    state.ik_compress.assign(ik_n, 0u);
+    state.ik_stretch.assign(ik_n, 0u);
+    for (size_t i = 0; i < ik_n; ++i)
+    {
+        state.ik_mix[i] = asset.iks[i].mix;
+        state.ik_bend_dir[i] = asset.iks[i].bend_dir;
+        state.ik_compress[i] = (asset.iks[i].flags & SpineGpuIkFlags::kIkFlagCompress) != 0 ? 1u : 0u;
+        state.ik_stretch[i] = (asset.iks[i].flags & SpineGpuIkFlags::kIkFlagStretch) != 0 ? 1u : 0u;
+    }
+    const size_t tf_n = asset.transforms.size();
+    state.tf_rotate_mix.assign(tf_n, 0.0f);
+    state.tf_translate_mix.assign(tf_n, 0.0f);
+    state.tf_scale_mix.assign(tf_n, 0.0f);
+    state.tf_shear_mix.assign(tf_n, 0.0f);
+    for (size_t i = 0; i < tf_n; ++i)
+    {
+        state.tf_rotate_mix[i] = asset.transforms[i].rotate_mix;
+        state.tf_translate_mix[i] = asset.transforms[i].translate_mix;
+        state.tf_scale_mix[i] = asset.transforms[i].scale_mix;
+        state.tf_shear_mix[i] = asset.transforms[i].shear_mix;
+    }
+    const size_t path_n = asset.paths.size();
+    state.path_position.assign(path_n, 0.0f);
+    state.path_spacing.assign(path_n, 0.0f);
+    state.path_rotate_mix.assign(path_n, 0.0f);
+    state.path_translate_mix.assign(path_n, 0.0f);
+    for (size_t i = 0; i < path_n; ++i)
     {
         state.path_position[i] = asset.paths[i].position;
         state.path_spacing[i] = asset.paths[i].spacing;
@@ -1745,11 +2068,7 @@ SpineImportResult SpineGpuInitSkeletonState(const SpineGpuAsset& asset, const Sp
         s.parent = b.parent;
         s.mode = b.transform_mode;
     }
-    out.path_position.assign(asset.paths.size(), 0.0f);
-    out.path_spacing.assign(asset.paths.size(), 0.0f);
-    out.path_rotate_mix.assign(asset.paths.size(), 0.0f);
-    out.path_translate_mix.assign(asset.paths.size(), 0.0f);
-    SpineGpuSetBonesToSetupPose(asset, out);   // Bone 构造函数里那次 + PathConstraint 构造取 data 值
+    SpineGpuSetBonesToSetupPose(asset, out);   // Bone 构造函数里那次 + 三类约束构造时取 data 值
 
     // `Slot::Slot()`（Slot.cpp:42-52）：color(1,1,1,1)、darkColor(0,0,0,0)、attachment NULL，再 setToSetupPose
     out.slots.assign(slot_count, SpineGpuSlotState {});
@@ -1800,15 +2119,14 @@ SpineImportResult SpineGpuApplyTimeline(const SpineGpuAsset& asset, const SpineG
             return ApplyPathPosition(asset, state, tl_index, rt, time, alpha, blend);
         case SpineTimelineType::kPathConstraintMix:
             return ApplyPathMix(asset, state, tl_index, rt, time, alpha, blend);
+        case SpineTimelineType::kPathConstraintSpacing:
+            return ApplyPathSpacing(asset, state, tl_index, rt, time, alpha, blend);
+        case SpineTimelineType::kIkConstraint:
+            return ApplyIkConstraint(asset, state, tl_index, rt, time, alpha, blend, direction);
+        case SpineTimelineType::kTransformConstraint:
+            return ApplyTransformConstraint(asset, state, tl_index, rt, time, alpha, blend);
         case SpineTimelineType::kEvent:
             return Ok();   // 事件不改渲染状态（本实现不派发事件）
-        case SpineTimelineType::kIkConstraint:
-        case SpineTimelineType::kTransformConstraint:
-        case SpineTimelineType::kPathConstraintSpacing:
-            // 这三类**会改姿势**，本阶段不做 ⇒ 显式报错，不能静默跳过
-            // （实测 0 / 782 个资产用到，所以不会真的挡住任何资产）。
-            return Fail("apply: " + TlName(tl_index) + "类型 " + std::to_string(rt.type) +
-                        " 本阶段不做（会改姿势，跳过会得到静默错的姿势）");
     }
     return Fail("apply: " + TlName(tl_index) + "类型 " + std::to_string(rt.type) + " 不认识");
 }

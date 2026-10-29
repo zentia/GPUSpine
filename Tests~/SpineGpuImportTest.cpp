@@ -14,6 +14,7 @@
 
 #include "SpineGpuAnimSolver.h"
 #include "SpineGpuBatch.h"
+#include "SpineGpuConstraintFixture.h"
 #include "SpineGpuEventFixture.h"
 #include "SpineGpuSkinFixture.h"
 #include "SpineGpuAnimationState.h"
@@ -2795,6 +2796,167 @@ int main(int argc, char** argv)
             if (kinfo.deform_capacity != 26u)
             {
                 std::printf("  deform_capacity = %zu\n", kinfo.deform_capacity);
+            }
+        }
+        g_prefix.clear();
+    }
+
+    // =================================================================
+    // 约束参数时间轴（IK / transform / pathSpacing）。
+    // 夹具见 SpineGpuConstraintFixture.h：OSGame 782 个资产用到这三类时间轴的是 0 个
+    // ⇒ 期望值只能手推，而且必须推到"解算器读的是运行时值而不是 setup 常量"这一层。
+    // 与 spine-cpp 的随机脚本逐帧对拍在 SpineGpuRefParityTest（同一个夹具）。
+    // =================================================================
+    {
+        g_prefix = "[constraint-tl] ";
+        auto Near = [](float got, float want) { return std::fabs(got - want) < 1e-6f; };
+        SpineAtlas catlas;
+        SpineSourceSkeleton csrc;
+        SpineGpuAsset ca;
+        SpineImportResult cr = ParseSpineAtlas(SpineGpuConstraintFixture::kAtlas,
+                                               std::strlen(SpineGpuConstraintFixture::kAtlas), catlas);
+        if (cr.ok)
+        {
+            cr = ParseSpineSkeletonJson(SpineGpuConstraintFixture::kSkeleton,
+                                        std::strlen(SpineGpuConstraintFixture::kSkeleton), &catlas, csrc);
+        }
+        if (cr.ok)
+        {
+            cr = BakeSpineGpuAsset(csrc, ca);
+        }
+        SpineGpuRuntimeData cd;
+        SpineGpuSkeletonState cs;
+        if (cr.ok)
+        {
+            cr = SpineGpuBuildRuntimeData(ca, cd);
+        }
+        if (cr.ok)
+        {
+            cr = SpineGpuInitSkeletonState(ca, cd, cs);
+        }
+        Check(cr.ok, "夹具烘焙 + 查找表 + 初始状态");
+        if (!cr.ok)
+        {
+            std::printf("  error: %s\n", cr.error.c_str());
+        }
+        if (cr.ok && ca.iks.size() == 1 && ca.transforms.size() == 2 && ca.paths.size() == 1)
+        {
+            // ---- setup（Skeleton::setBonesToSetupPose）----
+            Check(Near(cs.ik_mix[0], 0.35f) && cs.ik_bend_dir[0] == -1 && cs.ik_compress[0] == 1 &&
+                      cs.ik_stretch[0] == 0,
+                  "IK setup：mix 0.35 / bend -1（bendPositive=false）/ compress 1 / stretch 0");
+            Check(Near(cs.tf_rotate_mix[0], 0.15f) && Near(cs.tf_translate_mix[0], 0.25f) &&
+                      Near(cs.tf_scale_mix[0], 0.35f) && Near(cs.tf_shear_mix[0], 0.45f) &&
+                      Near(cs.tf_rotate_mix[1], 0.55f) && Near(cs.tf_shear_mix[1], 0.85f),
+                  "transform setup：tf1 0.15/0.25/0.35/0.45、tf2 0.55/…/0.85");
+            Check(Near(cs.path_position[0], 0.2f) && Near(cs.path_spacing[0], 5.0f), "path setup：position 0.2 / spacing 5");
+
+            uint32_t con_a = 0;
+            bool found_a = false;
+            for (uint32_t i = 0; i < ca.anim_names.size(); ++i)
+            {
+                if (ca.anim_names[i] == "con_a")
+                {
+                    con_a = i;
+                    found_a = true;
+                }
+            }
+            Check(found_a, "夹具里有 con_a 动画");
+
+            // ---- con_a @ t = 0.2，alpha = 1 / MixBlend_First / MixDirection_In ----
+            // 手推（三段里只有 segment 0 是线性，percent = 1 - (0.2 - t1) / (t0 - t1)）：
+            //   ik1   [0, 0.4] 线性：percent = 1 - (0.2-0.4)/(0-0.4) = 0.5
+            //         mix = 0.05 + (0.95-0.05)·0.5 = 0.5；alpha=1 ⇒ mix = 0.35 + (0.5-0.35) = 0.5
+            //         bend / compress / stretch 取**前一帧**（Replace 分支没有笔误）：+1 / 0 / 0
+            //   tf1   [0, 0.5] 线性：percent = 1 - (0.2-0.5)/(0-0.5) = 0.4
+            //         rotate = 0.05+0.8·0.4 = 0.37；translate = 0.15+0.6·0.4 = 0.39；
+            //         scale  = 0.25+0.4·0.4 = 0.41；shear = 0.35+0.2·0.4 = 0.43（alpha=1 ⇒ 直接覆盖）
+            //   tf2   [0.2, 0.8] bezier：percent = 1 - (0.2-0.8)/(0.2-0.8) = 0 ⇒ 取前一帧 0.1/0.2/0.3/0.4
+            SpineGpuSkeletonState a1;
+            const bool ap1 = SpineGpuInitSkeletonState(ca, cd, a1).ok &&
+                             SpineGpuApplyAnimation(ca, cd, a1, con_a, 0.0f, 0.2f, false, 1.0f,
+                                                    SpineGpuMixBlend::kFirst, SpineGpuMixDirection::kIn)
+                                 .ok;
+            Check(ap1, "con_a @0.2 能 apply（这三类时间轴不再显式报错）");
+            if (ap1)
+            {
+                Check(Near(a1.ik_mix[0], 0.5f), "ik.mix = 0.5（≠ setup 0.35 ⇒ 时间轴真的写了运行时值）");
+                Check(a1.ik_bend_dir[0] == 1 && a1.ik_compress[0] == 0 && a1.ik_stretch[0] == 0,
+                      "ik.bendDir = +1 / compress 0 / stretch 0（前一帧，Replace 分支）");
+                Check(Near(a1.tf_rotate_mix[0], 0.37f) && Near(a1.tf_translate_mix[0], 0.39f) &&
+                          Near(a1.tf_scale_mix[0], 0.41f) && Near(a1.tf_shear_mix[0], 0.43f),
+                      "tf1 四 mix = 0.37 / 0.39 / 0.41 / 0.43");
+                Check(Near(a1.tf_rotate_mix[1], 0.1f) && Near(a1.tf_translate_mix[1], 0.2f) &&
+                          Near(a1.tf_scale_mix[1], 0.3f) && Near(a1.tf_shear_mix[1], 0.4f),
+                      "tf2 四 mix = 前一帧 0.1 / 0.2 / 0.3 / 0.4（percent = 0）");
+
+                // ---- 牙口：解算器读的必须是**状态里的**值，不是 asset 里的 setup 常量 ----
+                // 把参数改回 setup，姿势必须变；不变就说明 SpineGpuUpdateWorld 还在读 setup。
+                SpineGpuPoseResult p1, p2;
+                const bool w1 = SpineGpuUpdateWorld(ca, cd, a1, p1).ok;
+                a1.ik_mix[0] = ca.iks[0].mix;
+                const bool w2 = SpineGpuUpdateWorld(ca, cd, a1, p2).ok;
+                Check(w1 && w2, "两次 updateWorld 都成功");
+                bool bone_diff = false;
+                float worst = 0.0f;
+                for (size_t i = 0; i < p1.bones.size() && i < p2.bones.size(); ++i)
+                {
+                    const float dx = std::fabs(p1.bones[i].world_x - p2.bones[i].world_x);
+                    const float dy = std::fabs(p1.bones[i].world_y - p2.bones[i].world_y);
+                    worst = std::fmax(worst, std::fmax(dx, dy));
+                    bone_diff = bone_diff || dx > 1e-4f || dy > 1e-4f;
+                }
+                Check(bone_diff, "把 ik_mix 改回 setup ⇒ 骨骼世界位置变了（解算器读状态，不读 setup）");
+            }
+
+            // ---- con_a @ t = 0.8：path spacing 的线性段 [0.6, 1.0] ----
+            // percent = 1 - (0.8-1.0)/(0.6-1.0) = 0.5 ⇒ spacing = 25 + (8-25)·0.5 = 16.5
+            SpineGpuSkeletonState a2;
+            const bool ap2 = SpineGpuInitSkeletonState(ca, cd, a2).ok &&
+                             SpineGpuApplyAnimation(ca, cd, a2, con_a, 0.0f, 0.8f, false, 1.0f,
+                                                    SpineGpuMixBlend::kFirst, SpineGpuMixDirection::kIn)
+                                 .ok;
+            Check(ap2 && Near(a2.path_spacing[0], 16.5f), "path.spacing @0.8 = 16.5（≠ setup 5）");
+            if (!(ap2 && Near(a2.path_spacing[0], 16.5f)))
+            {
+                std::printf("  ap2=%d spacing=%.9g setup=%.9g\n", ap2 ? 1 : 0,
+                            static_cast<double>(a2.path_spacing[0]), static_cast<double>(ca.paths[0].spacing));
+            }
+
+            // ---- MixBlend_Setup 分支：ik.bendDir 取**末帧**（3.8 的笔误，IkConstraintTimeline.cpp:131）----
+            // con_b 的 ik1 末帧 bendPositive = false（= -1）；t = 0.2 落在 [0, 0.7] 这一段上，
+            // 参考实现在这一支读的是 `_frames[_frames.size() + PREV_BEND_DIRECTION]` ⇒ -1，
+            // 而同一处的 compress / stretch 读前一帧（帧 0：compress 1 / stretch 1）。
+            uint32_t con_b = 0;
+            for (uint32_t i = 0; i < ca.anim_names.size(); ++i)
+            {
+                con_b = ca.anim_names[i] == "con_b" ? i : con_b;
+            }
+            SpineGpuSkeletonState b1;
+            const bool bp1 = SpineGpuInitSkeletonState(ca, cd, b1).ok &&
+                             SpineGpuApplyAnimation(ca, cd, b1, con_b, 0.0f, 0.2f, false, 1.0f,
+                                                    SpineGpuMixBlend::kSetup, SpineGpuMixDirection::kIn)
+                                 .ok;
+            Check(bp1 && b1.ik_bend_dir[0] == -1 && b1.ik_compress[0] == 1 && b1.ik_stretch[0] == 1,
+                  "Setup 分支：bendDir = 末帧 -1、compress / stretch = 前一帧 1 / 1");
+
+            // ---- 越界的约束下标 ⇒ 载入期报错（读下去是越界读，不报错）----
+            SpineGpuAsset bad = ca;
+            uint32_t ik_tl = 0xFFFFFFFFu;
+            for (uint32_t i = 0; i < bad.timelines.size(); ++i)
+            {
+                if (bad.timelines[i].type == static_cast<uint32_t>(SpineTimelineType::kIkConstraint))
+                {
+                    ik_tl = i;
+                    break;
+                }
+            }
+            Check(ik_tl != 0xFFFFFFFFu, "容器里有 IK 时间轴");
+            if (ik_tl != 0xFFFFFFFFu)
+            {
+                bad.timelines[ik_tl].target = 99u;
+                SpineGpuRuntimeData bd;
+                Check(!SpineGpuBuildRuntimeData(bad, bd).ok, "IK 时间轴的目标约束越界 ⇒ 载入期报错");
             }
         }
         g_prefix.clear();
