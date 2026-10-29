@@ -1,4 +1,4 @@
-#include "Runtime/Function/Render/Spine/SpineGpuSkeletonState.h"
+#include "SpineGpuSkeletonState.h"
 
 #include <cmath>
 #include <cstring>
@@ -978,9 +978,11 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
                 SetFixedSize(vertices, n);
                 if (rigid)
                 {
+                    float* __restrict v0 = vertices.data();
+                    const float* __restrict s0 = setup;   // 与 §17.5 同一招
                     for (size_t i = 0; i < n; ++i)
                     {
-                        vertices[i] += (setup[i] - vertices[i]) * alpha;
+                        v0[i] += (s0[i] - v0[i]) * alpha;
                     }
                 }
                 else
@@ -1000,6 +1002,12 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
 
     SetFixedSize(vertices, n);
 
+    // 【§17.5 同一招】下面每条逐顶点循环都跑在几块**互不相交**的数据上：`vertices` = 槽位的
+    // deform 向量、`setup` = 顶点缓冲里的 setup 顶点、`last` / `prev_v` / `next_v` =
+    // thread_local scratch。不写明 `__restrict`，MSVC 得假设它们可能重叠 ⇒ 不向量化。
+    float* __restrict vr = vertices.data();
+    const float* __restrict sr = setup;   // weighted（非 rigid）时是 nullptr，那些分支不解引用它
+
     if (time >= fv.LastTime())
     {
         std::vector<float>& last = t_deform_scratch.prev;   // 复用（这条分支不会同时用 prev）
@@ -1007,6 +1015,9 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
         {
             return Fail("apply: " + TlName(tl_index) + "（deform）的帧超出 deform 长度");
         }
+        // ⚠️ 必须在 `ExpandDeformFrame` **之后**取：它里面是 `full.assign()`，容量不够时会
+        //    重新分配，提前取的指针会悬垂（预热期 / 遇到更长的 deform 时间轴时就会踩到）。
+        const float* __restrict lr = last.data();
         if (alpha == 1.0f)
         {
             if (blend == SpineGpuMixBlend::kAdd)
@@ -1015,14 +1026,14 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
                 {
                     for (size_t i = 0; i < n; ++i)
                     {
-                        vertices[i] += last[i] - setup[i];
+                        vr[i] += lr[i] - sr[i];
                     }
                 }
                 else
                 {
                     for (size_t i = 0; i < n; ++i)
                     {
-                        vertices[i] += last[i];
+                        vr[i] += lr[i];
                     }
                 }
             }
@@ -1039,15 +1050,15 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
                 {
                     for (size_t i = 0; i < n; ++i)
                     {
-                        const float s = setup[i];
-                        vertices[i] = s + (last[i] - s) * alpha;
+                        const float s = sr[i];
+                        vr[i] = s + (lr[i] - s) * alpha;
                     }
                 }
                 else
                 {
                     for (size_t i = 0; i < n; ++i)
                     {
-                        vertices[i] = last[i] * alpha;
+                        vr[i] = lr[i] * alpha;
                     }
                 }
                 break;
@@ -1055,7 +1066,7 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
             case SpineGpuMixBlend::kReplace:
                 for (size_t i = 0; i < n; ++i)
                 {
-                    vertices[i] += (last[i] - vertices[i]) * alpha;
+                    vr[i] += (lr[i] - vr[i]) * alpha;
                 }
                 break;
             case SpineGpuMixBlend::kAdd:
@@ -1063,14 +1074,14 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
                 {
                     for (size_t i = 0; i < n; ++i)
                     {
-                        vertices[i] += (last[i] - setup[i]) * alpha;
+                        vr[i] += (lr[i] - sr[i]) * alpha;
                     }
                 }
                 else
                 {
                     for (size_t i = 0; i < n; ++i)
                     {
-                        vertices[i] += last[i] * alpha;
+                        vr[i] += lr[i] * alpha;
                     }
                 }
                 break;
@@ -1093,14 +1104,17 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
     {
         return Fail("apply: " + TlName(tl_index) + "（deform）的帧超出 deform 长度");
     }
+    // ⚠️ 同上：两个指针都在两次 `ExpandDeformFrame` **之后**才取（`assign` 可能重分配）。
+    const float* __restrict pvr = prev_v.data();
+    const float* __restrict nvr = next_v.data();
     if (alpha == 1.0f)
     {
         if (blend == SpineGpuMixBlend::kAdd)
         {
             for (size_t i = 0; i < n; ++i)
             {
-                const float p = prev_v[i];
-                vertices[i] += rigid ? (p + (next_v[i] - p) * percent - setup[i]) : (p + (next_v[i] - p) * percent);
+                const float p = pvr[i];
+                vr[i] += rigid ? (p + (nvr[i] - p) * percent - sr[i]) : (p + (nvr[i] - p) * percent);
             }
         }
         else
@@ -1108,13 +1122,12 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
             // `__restrict`：`vertices` 是槽位的 deform 向量、prev/next 是 thread_local scratch，
             // 三者互不相交；不写这句 MSVC 不做向量化（实测这条循环 + 上面 `ExpandDeformFrame`
             // 里的 setup 累加一共值 3.0~4.7%，规格 §17.5）。
-            float* __restrict v = vertices.data();
-            const float* __restrict pv = prev_v.data();
-            const float* __restrict nv = next_v.data();
+            // 指针沿用外层的 `vr` / `pvr` / `nvr` —— 同一个对象**只能有一份** `__restrict` 指针，
+            // 否则"基于 restrict 的访问"这条约定自己就破了。
             for (size_t i = 0; i < n; ++i)
             {
-                const float p = pv[i];
-                v[i] = p + (nv[i] - p) * percent;
+                const float p = pvr[i];
+                vr[i] = p + (nvr[i] - p) * percent;
             }
         }
         return Ok();
@@ -1124,15 +1137,15 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
         case SpineGpuMixBlend::kSetup:
             for (size_t i = 0; i < n; ++i)
             {
-                const float p = prev_v[i];
+                const float p = pvr[i];
                 if (rigid)
                 {
-                    const float s = setup[i];
-                    vertices[i] = s + (p + (next_v[i] - p) * percent - s) * alpha;
+                    const float s = sr[i];
+                    vr[i] = s + (p + (nvr[i] - p) * percent - s) * alpha;
                 }
                 else
                 {
-                    vertices[i] = (p + (next_v[i] - p) * percent) * alpha;
+                    vr[i] = (p + (nvr[i] - p) * percent) * alpha;
                 }
             }
             break;
@@ -1140,21 +1153,21 @@ SpineImportResult ApplyDeform(const SpineGpuAsset& asset, const SpineGpuRuntimeD
         case SpineGpuMixBlend::kReplace:
             for (size_t i = 0; i < n; ++i)
             {
-                const float p = prev_v[i];
-                vertices[i] += (p + (next_v[i] - p) * percent - vertices[i]) * alpha;
+                const float p = pvr[i];
+                vr[i] += (p + (nvr[i] - p) * percent - vr[i]) * alpha;
             }
             break;
         case SpineGpuMixBlend::kAdd:
             for (size_t i = 0; i < n; ++i)
             {
-                const float p = prev_v[i];
+                const float p = pvr[i];
                 if (rigid)
                 {
-                    vertices[i] += (p + (next_v[i] - p) * percent - setup[i]) * alpha;
+                    vr[i] += (p + (nvr[i] - p) * percent - sr[i]) * alpha;
                 }
                 else
                 {
-                    vertices[i] += (p + (next_v[i] - p) * percent) * alpha;
+                    vr[i] += (p + (nvr[i] - p) * percent) * alpha;
                 }
             }
             break;

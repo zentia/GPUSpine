@@ -1,4 +1,4 @@
-#include "Runtime/Function/Render/Spine/SpineGpuClipper.h"
+#include "SpineGpuClipper.h"
 
 #include <cmath>
 #include <cstring>
@@ -576,17 +576,23 @@ void SpineGpuSkeletonClipping::ClipTriangles(const float* vertices, const uint16
                 }
                 clipped_vertices.resize(s + clip_output_count * 2, 0.0f);
                 m_ClippedUVs.resize(s + clip_output_count * 2, 0.0f);
+                // 三块数据互不相交（`clip_output` 是本轮裁剪的结果，两个输出是各自的成员向量），
+                // 写明 `__restrict` 这段才能向量化 —— 与 deform 那几条循环同一招（规格 §17.5）。
+                // ⚠️ resize 之后才取 `.data()`，循环里不会再扩容。
+                float* __restrict cv = clipped_vertices.data();
+                float* __restrict cuv = m_ClippedUVs.data();
+                const float* __restrict co = clip_output.data();
                 for (size_t ii = 0; ii < clip_output_length; ii += 2)
                 {
-                    float x = clip_output[ii], y = clip_output[ii + 1];
-                    clipped_vertices[s] = x;
-                    clipped_vertices[s + 1] = y;
+                    float x = co[ii], y = co[ii + 1];
+                    cv[s] = x;
+                    cv[s + 1] = y;
                     float c0 = x - x3, c1 = y - y3;
                     float a = (d0 * c0 + d1 * c1) * d;
                     float b = (d4 * c0 + d2 * c1) * d;
                     float c = 1 - a - b;
-                    m_ClippedUVs[s] = u1 * a + u2 * b + u3 * c;
-                    m_ClippedUVs[s + 1] = v1 * a + v2 * b + v3 * c;
+                    cuv[s] = u1 * a + u2 * b + u3 * c;
+                    cuv[s + 1] = v1 * a + v2 * b + v3 * c;
                     s += 2;
                 }
 
