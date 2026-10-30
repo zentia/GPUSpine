@@ -92,8 +92,9 @@ if(GPUSPINE_REF_ROOT AND EXISTS "${GPUSPINE_REF_ROOT}/src/spine/Skeleton.cpp")
     endforeach()
     add_library(SpineReference STATIC EXCLUDE_FROM_ALL ${_ref_src})
     set_target_properties(SpineReference PROPERTIES CXX_STANDARD 20 FOLDER "GPUSpine/Tests")
-    # 按 config 改名：若上层工程把 ARCHIVE_OUTPUT_DIRECTORY 统一设成同一目录，
-    # Debug/Release 的 .lib 会互相覆盖 ⇒ LNK2038。
+    # 按 config 改名：历史上上层工程把 ARCHIVE_OUTPUT_DIRECTORY_<CONFIG> 统一设成
+    # 同一个扁平目录，Debug/Release 的 .lib 会互相覆盖 ⇒ LNK2038。上层已不再覆盖
+    # 按 config 的变量（多配置生成器会自行追加 <Config>），这里保留改名仅作防御。
     set_target_properties(SpineReference PROPERTIES OUTPUT_NAME "SpineReference_$<CONFIG>")
     # 参考实现内部互相 include 写的是 `Modules/Spine/spine-cpp/include/spine/X.h`
     # （相对 Unity 引擎根）⇒ 除 include/ 外还要挂引擎根（spine-cpp 的上三级）。
@@ -119,16 +120,9 @@ else()
     message(STATUS "GPUSpine: 未提供 GPUSPINE_REF_ROOT ⇒ 不注册参考对拍与基准")
 endif()
 
-# ---- 跨语言对拍（C++ 写 → C# 读 → C# 写，必须逐字节相同）----
-# 没装 dotnet 就跳过（加码，不是前置条件）。
-find_program(GPUSPINE_DOTNET NAMES dotnet)
-option(GPUSPINE_BUILD_CSHARP_PARITY_TEST "C++/C# 容器逐字节对拍" ON)
-if(GPUSPINE_BUILD_CSHARP_PARITY_TEST AND GPUSPINE_DOTNET)
-    add_test(NAME SpineGpuCSharpParityTest
-             COMMAND ${CMAKE_COMMAND}
-                     -DDUMP_EXE=$<TARGET_FILE:SpineGpuImportTest>
-                     -DDUMP_DIR=${CMAKE_BINARY_DIR}/spine_containers
-                     -DCSPROJ=${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/CSharp/Test/ZEngine.SpineGpu.Test.csproj
-                     -DDOTNET=${GPUSPINE_DOTNET}
-                     -P ${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/CSharp/Test/RunParityTest.cmake)
-endif()
+# ---------------------------------------------------------------------
+# 曾经这里有"跨语言对拍"（C++ 写 → C# 读 → C# 写，必须逐字节相同），2026-10-30
+# 随 Runtime/CSharp/ 一起删除：Unity 侧的导入器改成引擎内 C++，直接调本 core，
+# 不再需要"复刻一份 C# 再对拍"。跨端一致性现在由"同一个子模块 = 同一份代码"
+# 结构性保证（与 GPUParticle 同一条理由）。
+# ---------------------------------------------------------------------
